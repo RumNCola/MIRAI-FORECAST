@@ -6,37 +6,78 @@ Scripts en **R** para estimar la demanda diaria de cada producto de **Franklin**
 
 | Script | Local | Modelo inicial | Días considerados |
 |---|---|---|---|
-| `modelo_demanda_Franklin_sigma.R` | Franklin | `demanda ~ dia + mes` | Viernes, sábado y domingo |
-| `modelo_demanda_MUT_sigma.R` | MUT | `demanda ~ dia` | Lunes a domingo |
+| `modelo_demanda_Franklin.R` | Franklin | `demanda ~ dia + mes` | Viernes, sábado y domingo |
+| `modelo_demanda_MUT.R` | MUT | `demanda ~ dia` | Lunes a domingo |
 
-**Dependencias:** `readxl` y `writexl` (el resto utiliza funciones de R base).
-
-```r
-install.packages(c("readxl", "writexl")) # Solo una vez
-source("scripts/modelo_demanda_Franklin_sigma.R")
-source("scripts/modelo_demanda_MUT_sigma.R")
-```
-
-Antes de ejecutar, editar la sección **CONFIGURACION** de cada script:
+**Dependencias:** Python del repositorio, R y los paquetes `arrow`, `digest`,
+`jsonlite`, `tzdb` y `writexl`. La lista también está declarada en `R_PACKAGES`, dentro de
+`settings/config.py`. `main.bat` prepara estas dependencias y después llama a
+`main.py` para ejecutar ELT, Franklin y MUT en ese orden. Requiere Python 3.12+;
+si falta R, descarga su instalador oficial y lo instala dentro de `.runtime/`.
 
 ```r
-ARCHIVO <- "datos/nombre_del_excel.xlsx"
-HOJA <- "Nombre de la hoja"
-COL_FECHA <- "Fecha"
-COL_PRODUCTO <- "Producto"   # En Franklin puede ser "Categoria_Agrupada"
-COL_CANTIDAD <- "Cantidad"  # En Franklin puede ser "Cantidades vendidas"
-SALIDA <- "resultados/mut"  # Ajustar según el local
-HORIZONTE <- 28             # Días calendario futuros
+install.packages(c("arrow", "digest", "jsonlite", "tzdb", "writexl")) # Solo una vez
+source("scripts/modelo_demanda_Franklin.R")
+source("scripts/modelo_demanda_MUT.R")
 ```
 
-Se supone que los Excel **ya están limpios y estandarizados**. No se buscan archivos ni se identifican columnas automáticamente: se cambian esas variables si varían sus nombres.
+También pueden ejecutarse como procesos independientes, que es el contrato para
+`main.py`:
+
+```powershell
+Rscript scripts/modelo_demanda_Franklin.R
+Rscript scripts/modelo_demanda_MUT.R
+```
+
+Los scripts localizan el repositorio desde su propio archivo, independientemente
+del directorio de ejecución. Seleccionan Python desde `MIRAI_PYTHON`, si está
+definido, o desde `.venv` y después el PATH. No instalan paquetes automáticamente.
+
+### Configuración central
+
+Editar únicamente `settings/config.py`: `HORIZON_DAYS` establece el horizonte
+común y `MODEL_SETTINGS` contiene la configuración de cada local. Los modelos R
+consumen un contrato JSON emitido por ese módulo. Se puede inspeccionar con:
+
+```powershell
+python settings/config.py --site FRANKLIN
+python settings/config.py --site MUT
+```
+
+Las opciones incluyen `model`, `horizon_days`, `operating_weekdays` (lunes=1,
+domingo=7), columnas de entrada, subcarpeta de salida, formatos de tablas,
+generación y tamaño de gráficos, ventana histórica y mínimo de observaciones
+para el sigma por día. Por defecto se generan tanto Excel como Parquet y PNG.
+Las rutas de salida deben permanecer dentro de `out/`. `ModelSettings` y
+`get_model_config()` también se pueden importar desde Python o una futura interfaz.
+
+### Entradas DEL
+
+- Franklin usa exclusivamente `Data/DEL/FRANKLIN_SALES/`; no mezcla los movimientos
+  y notas de crédito de `FRANKLIN_STORE`.
+- MUT usa todos los archivos aceptados de `Data/DEL/MUT_SALES/`, aunque tengan
+  distintas columnas opcionales. `MUT_STORE` se puede seleccionar explícitamente
+  como fuente alternativa en la configuración.
+- Se requiere `elt_log.json`, generado por el ELT. Se leen únicamente los
+  artefactos con estado `processed`, una vez por ruta de salida. Se verifican
+  SHA-256, procedencia, filas y unidades antes del modelado. Las entradas fallidas
+  del ELT se excluyen con advertencia; los archivos ajenos al registro no entran
+  al modelo.
+- Las columnas predeterminadas son `date`, `product_name` y `quantity`. Se
+  conservan los nombres originales. La antigua `Categoria_Agrupada` de Franklin
+  no está en DEL: se modela cada `product_name`, sin reconstruir agrupaciones ni
+  aplicar correcciones de nombres.
+- MUT incluye solo estados de pago configurados (por defecto `pagado`).
+  Las filas repetidas dentro de un archivo se conservan. Los períodos de archivos
+  distintos que se superponen detienen el modelo por defecto; revisar la causa
+  antes de desactivar `reject_overlapping_dates`.
 
 ## 2. Modelos y supuestos
 
 Se ajusta **una regresión lineal por producto** usando todos los registros históricos disponibles; no hay separación entre entrenamiento y prueba ni selección por BIC.
 
-- **Franklin:** `MODELO <- "dia_mes_anual"` (predeterminado) estima `demanda ~ dia + mes`; también permite `MODELO <- "dia"`. Se excluyen las observaciones extraordinarias de lunes a jueves.
-- **MUT:** `SOLO_DIA <- TRUE` (predeterminado) estima `demanda ~ dia`. Cuando exista mayor historial, `SOLO_DIA <- FALSE` permite probar `demanda ~ dia + mes`.
+- **Franklin:** `model="dia_mes_anual"` (predeterminado) estima `demanda ~ dia + mes`; también permite `model="dia"`. Se excluyen las observaciones extraordinarias de lunes a jueves según los días configurados.
+- **MUT:** `model="dia"` (predeterminado) estima `demanda ~ dia`. `model="dia_mes_anual"` permite probar `demanda ~ dia + mes`.
 - **Mes:** es una variable categórica de enero a diciembre, no una tendencia temporal. No se incluye semana del mes ni interacciones.
 - **Productos:** las cantidades se suman por fecha y producto. Desde la primera venta observada de cada producto, su ausencia en una fecha con ventas del local se interpreta como **cero ventas**; no se inventan días de apertura sin registros.
 - **Historial insuficiente:** si la especificación solicitada no puede estimarse o proyectarse, el script intenta `demanda ~ dia` y, en último caso, un promedio. Esto se informa en `modelo_aplicado`.
@@ -46,11 +87,16 @@ Se ajusta **una regresión lineal por producto** usando todos los registros hist
 
 ## 3. Archivos generados
 
-Cada script crea `modelo_demanda_Franklin.xlsx` o `modelo_demanda_MUT.xlsx` en la carpeta `SALIDA`, y una subcarpeta `graficos/` con **un PNG de seis paneles por producto** (histórico, promedios, dispersión, residuos y pronóstico).
+Cada script guarda sus resultados en `out/franklin/` o `out/mut/`, según la
+configuración. Por defecto crea `modelo_demanda_Franklin.xlsx` o
+`modelo_demanda_MUT.xlsx`, las seis tablas del análisis en archivos `.parquet`,
+y una subcarpeta `graphs/` con **un PNG de seis paneles por producto** (histórico,
+promedios, dispersión, residuos y pronóstico). `config_used.json` registra los
+parámetros utilizados, archivos DEL y fecha de generación.
 
 | Hoja del Excel | Contenido |
 |---|---|
-| `Configuracion` | Archivo de entrada, horizonte y modelo solicitado |
+| `Configuracion` | Fuente y archivos DEL, horizonte y modelo solicitado |
 | `Pronosticos` | Producto, fecha, día, mes, `demanda_predicha`, `sigma_utilizada`, `varianza_utilizada` y modelo aplicado |
 | `Metricas` | Unidades vendidas, N, R², R² ajustado, MAE, RMSE, WAPE y varianza residual por producto |
 | `Historico` | Ventas observadas, ajustes y residuos por fecha y producto |
@@ -76,15 +122,22 @@ Para abastecer **varios días con una sola preparación**, hay que modelar la de
 
 ## 5. Calidad de ajuste y límites actuales
 
-Referencia de los archivos de resultados revisados (noviembre de 2026):
-
-| Métrica dentro de muestra | Franklin | MUT |
-|---|---:|---:|
-| Productos | 55 | 34 |
-| WAPE global, ponderado por unidades vendidas | 30,9 % | 41,5 % |
-| WAPE mediano por producto | 34,6 % | 67,6 % |
-| R² ajustado mediano | 0,558 | 0,104 |
-
-En Franklin los principales platos presentan ajustes razonables, especialmente sábados y domingos; los viernes tienen errores relativos mayores. MUT tiene un historial más corto y sus predicciones son menos estables para productos de baja rotación.
+Las métricas se recalculan con las entradas DEL y la configuración actual. Las
+cifras de los antiguos Excel consolidados no describen estas nuevas entradas,
+especialmente porque Franklin ya no usa la columna `Categoria_Agrupada`.
 
 **Precaución:** todas estas métricas se calcularon sobre los mismos datos usados para estimar. No demuestran precisión futura. Para evaluar la capacidad de pronóstico se recomienda incorporar, cuando haya más registros, una validación temporal o retrospectiva; el modelo final puede volver a entrenarse luego con todos los datos disponibles.
+
+## 6. Verificación
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Las pruebas de integración de los modelos se ejecutan si encuentran `Rscript` y
+sus paquetes, incluyendo el entorno preparado por `main.bat` en `.runtime/`.
+Se puede definir `MIRAI_RSCRIPT` con la ruta al ejecutable para las
+pruebas. Cuando R no está instalado se informa explícitamente que esa verificación
+se omite; las pruebas de configuración Python siguen ejecutándose. La validación
+opcional de sintaxis usa `tree-sitter==0.21.3` y
+`tree-sitter-languages==1.10.2`, sin requerir instalar R.

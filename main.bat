@@ -1,12 +1,49 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+pushd "%~dp0"
+if errorlevel 1 exit /b 1
 
-if not exist ".venv" (
-    python -m venv .venv
-)
+if exist ".venv\Scripts\python.exe" goto validate_environment
 
-call .venv/scripts/activate
+where py >nul 2>nul
+if errorlevel 1 goto use_python
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul
+if errorlevel 1 goto use_python
+py -3 -m venv ".venv"
+if errorlevel 1 goto failed
+goto validate_environment
 
-python.exe -m pip install --upgrade pip
+:use_python
+where python >nul 2>nul
+if errorlevel 1 goto missing_python
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul
+if errorlevel 1 goto missing_python
+python -m venv ".venv"
+if errorlevel 1 goto failed
 
-pip install -r requirements.txt
+:validate_environment
+".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
+if errorlevel 1 goto invalid_environment
+set "PYTHONUTF8=1"
 
-python main.py
+".venv\Scripts\python.exe" "scripts\bootstrap.py"
+if errorlevel 1 goto failed
+
+".venv\Scripts\python.exe" "main.py"
+set "MIRAI_EXIT_CODE=%errorlevel%"
+popd
+exit /b %MIRAI_EXIT_CODE%
+
+:missing_python
+echo ERROR: Install Python 3.12 or newer and run main.bat again.
+goto failed
+
+:invalid_environment
+echo ERROR: The existing .venv is broken or uses an unsupported Python version.
+echo Repair or recreate that environment, then run main.bat again.
+goto failed
+
+:failed
+echo ERROR: Execution stopped. See pipeline.log for setup and analysis details.
+popd
+exit /b 1

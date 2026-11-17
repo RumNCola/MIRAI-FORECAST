@@ -1,6 +1,6 @@
 # RAW-to-DEL processing
 
-Use Python 3.11 or newer. Install the dependencies with `python -m pip install -r requirements.txt`.
+Use Python 3.12 or newer. Install the dependencies with `python -m pip install -r requirements.txt`.
 All table processing and Parquet I/O use Polars natively. Openpyxl reads the
 Excel cell values and layouts; this pipeline does not use Pandas or PyArrow.
 

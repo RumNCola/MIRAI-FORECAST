@@ -17,6 +17,7 @@ import polars as pl
 
 from settings.config import MODEL_SETTINGS, get_model_config
 from src.elt import ELT
+from src.runtime import find_rscript, r_environment
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -97,15 +98,16 @@ class ModelConfigTests(unittest.TestCase):
 class RModelIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.rscript = os.environ.get("MIRAI_RSCRIPT") or shutil.which("Rscript")
+        cls.rscript = find_rscript(REPOSITORY)
         if not cls.rscript:
             raise unittest.SkipTest("Rscript is not installed; native R model execution cannot be checked")
-        check = subprocess.run([cls.rscript, "-e", (
-            "packages <- c('arrow', 'digest', 'jsonlite', 'writexl'); "
+        cls.r_environment = r_environment(REPOSITORY, cls.rscript)
+        check = subprocess.run([str(cls.rscript), "--vanilla", "-e", (
+            "packages <- c('arrow', 'digest', 'jsonlite', 'tzdb', 'writexl'); "
             "quit(status=if(all(vapply(packages, requireNamespace, logical(1), quietly=TRUE))) 0 else 1)"
-        )], capture_output=True, text=True)
+        )], env=cls.r_environment, capture_output=True, text=True)
         if check.returncode:
-            raise unittest.SkipTest("R model packages are missing: arrow, digest, jsonlite, writexl")
+            raise unittest.SkipTest("R model packages are missing: arrow, digest, jsonlite, tzdb, writexl")
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -122,7 +124,7 @@ class RModelIntegrationTests(unittest.TestCase):
         rows = []
         for day in range(28):
             date = datetime(2026, 7, 6) + timedelta(days=day)
-            for number, name in enumerate(("Product A", "Product B "), 1):
+            for number, name in enumerate(("Product A", "Producto ñ "), 1):
                 rows.append({"date": date, "category": "Food", "subcategory": "Lunch",
                              "product_name": name, "quantity": number + day % 4,
                              "order_reference": f"order-{day}", "order_id": str(day),
@@ -139,11 +141,11 @@ class RModelIntegrationTests(unittest.TestCase):
         shutil.copyfile(self.raw / "MUT_SALES" / "first.parquet", self.raw / "MUT_SALES" / "copy.parquet")
         result = ELT(self.root).run()
         self.assertEqual(result.failed, 0)
-        self.environment = {**os.environ, "MIRAI_PYTHON": sys.executable}
+        self.environment = {**self.r_environment, "MIRAI_PYTHON": sys.executable}
 
     def run_model(self, site):
         script = "modelo_demanda_Franklin.R" if site == "FRANKLIN" else "modelo_demanda_MUT.R"
-        return subprocess.run([self.rscript, str(self.root / "scripts" / script)], cwd=self.root.parent,
+        return subprocess.run([str(self.rscript), "--vanilla", str(self.root / "scripts" / script)], cwd=self.root.parent,
                               env=self.environment, capture_output=True, text=True)
 
     def test_models_read_del_and_write_configured_analysis_outputs(self):
@@ -160,7 +162,7 @@ class RModelIntegrationTests(unittest.TestCase):
                 if site == "FRANKLIN":
                     expected = expected.filter(pl.col("date").dt.weekday().is_in([5, 6, 7]))
                 self.assertEqual(metrics["unidades_vendidas"].sum(), expected["quantity"].sum())
-                self.assertEqual(set(metrics["producto"]), {"Product A", "Product B "})
+                self.assertEqual(set(metrics["producto"]), {"Product A", "Producto ñ "})
                 self.assertEqual(forecast["fecha"].n_unique(), 3 if site == "FRANKLIN" else 7)
                 self.assertEqual(len(list(output.glob("*.parquet"))), 6)
                 self.assertEqual(len(list(output.glob("*.xlsx"))), 1)

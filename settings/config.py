@@ -14,8 +14,15 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+MIN_PYTHON = (3, 12)
 HORIZON_DAYS = 28
-R_PACKAGES = ("arrow", "digest", "jsonlite", "writexl")
+R_PACKAGES = ("arrow", "digest", "jsonlite", "tzdb", "writexl")
+R_VERSION = "4.6.2"
+CRAN_MIRROR = "https://cloud.r-project.org"
+MODEL_SCRIPTS = {
+    "FRANKLIN": "scripts/modelo_demanda_Franklin.R",
+    "MUT": "scripts/modelo_demanda_MUT.R",
+}
 
 
 @dataclass(frozen=True)

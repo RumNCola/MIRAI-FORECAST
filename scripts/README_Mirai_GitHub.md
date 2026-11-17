@@ -10,17 +10,19 @@ Scripts en **R** para estimar la demanda diaria de cada producto de **Franklin**
 | `modelo_demanda_MUT.R` | MUT | `demanda ~ dia` | Lunes a domingo |
 
 **Dependencias:** Python del repositorio, R y los paquetes `arrow`, `digest`,
-`jsonlite` y `writexl`. La lista también está declarada en `R_PACKAGES`, dentro de
-`settings/config.py`, para la futura preparación de dependencias desde `main.bat`.
+`jsonlite`, `tzdb` y `writexl`. La lista también está declarada en `R_PACKAGES`, dentro de
+`settings/config.py`. `main.bat` prepara estas dependencias y después llama a
+`main.py` para ejecutar ELT, Franklin y MUT en ese orden. Requiere Python 3.12+;
+si falta R, descarga su instalador oficial y lo instala dentro de `.runtime/`.
 
 ```r
-install.packages(c("arrow", "digest", "jsonlite", "writexl")) # Solo una vez
+install.packages(c("arrow", "digest", "jsonlite", "tzdb", "writexl")) # Solo una vez
 source("scripts/modelo_demanda_Franklin.R")
 source("scripts/modelo_demanda_MUT.R")
 ```
 
 También pueden ejecutarse como procesos independientes, que es el contrato para
-el futuro `main.py`:
+`main.py`:
 
 ```powershell
 Rscript scripts/modelo_demanda_Franklin.R
@@ -47,7 +49,7 @@ domingo=7), columnas de entrada, subcarpeta de salida, formatos de tablas,
 generación y tamaño de gráficos, ventana histórica y mínimo de observaciones
 para el sigma por día. Por defecto se generan tanto Excel como Parquet y PNG.
 Las rutas de salida deben permanecer dentro de `out/`. `ModelSettings` y
-`get_model_config()` también se pueden importar desde el futuro `main.py`.
+`get_model_config()` también se pueden importar desde Python o una futura interfaz.
 
 ### Entradas DEL
 
@@ -133,7 +135,8 @@ python -m unittest discover -s tests -v
 ```
 
 Las pruebas de integración de los modelos se ejecutan si encuentran `Rscript` y
-sus paquetes. Se puede definir `MIRAI_RSCRIPT` con la ruta al ejecutable para las
+sus paquetes, incluyendo el entorno preparado por `main.bat` en `.runtime/`.
+Se puede definir `MIRAI_RSCRIPT` con la ruta al ejecutable para las
 pruebas. Cuando R no está instalado se informa explícitamente que esa verificación
 se omite; las pruebas de configuración Python siguen ejecutándose. La validación
 opcional de sintaxis usa `tree-sitter==0.21.3` y

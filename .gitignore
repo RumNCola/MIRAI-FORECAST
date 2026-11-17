@@ -2,6 +2,9 @@
 /Data/
 /elt_log.json
 /.elt.lock
+/.pipeline.lock
+/.runtime/
+/out/
 
 # Python bytecode and caches
 __pycache__/

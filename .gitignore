@@ -1,5 +1,7 @@
 # Private project data (see README.md)
 /Data/
+/elt_log.json
+/.elt.lock
 
 # Python bytecode and caches
 __pycache__/

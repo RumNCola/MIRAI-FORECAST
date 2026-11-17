@@ -1,0 +1,85 @@
+# Private project data (see README.md)
+/Data/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+__pypackages__/
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.secrets/
+/secrets/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.whl
+pip-wheel-metadata/
+MANIFEST
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Tests, coverage, linters and type checkers
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.json
+nosetests.xml
+.hypothesis/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter and IPython local state
+.ipynb_checkpoints/
+.ipython/
+profile_default/
+ipython_config.py
+
+# Documentation build output
+docs/_build/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Editor settings
+.idea/
+.vscode/
+*.code-workspace
+
+# Operating system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

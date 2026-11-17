@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import logging
+import json
 import sys
 from pathlib import Path
 
-from settings.config import CRAN_MIRROR, MODEL_SCRIPTS, REPOSITORY_ROOT, get_model_config
+from settings.config import CRAN_MIRROR, MODEL_SCRIPTS, REPOSITORY_ROOT, ModelSettings, get_model_config
 from src.runtime import PipelineError, find_rscript, pipeline_lock, pipeline_logger, r_environment, run_logged
 
 
-def run_pipeline(root: Path, logger: logging.Logger) -> None:
+def run_pipeline(root: Path, logger: logging.Logger, *,
+                 model_settings: dict[str, ModelSettings] | None = None,
+                 data_root: Path | None = None, strict_inputs: bool = False) -> None:
     """Validate runtime/configuration before starting the ordered application flow."""
-    configurations = {site: get_model_config(site, repository_root=root) for site in MODEL_SCRIPTS}
-    for site, relative in MODEL_SCRIPTS.items():
+    if model_settings is not None and not model_settings:
+        raise ValueError("Select at least one site")
+    sites = tuple(model_settings) if model_settings is not None else tuple(MODEL_SCRIPTS)
+    workspace = data_root or root
+    configurations = {site: get_model_config(site, repository_root=workspace,
+                      settings=model_settings[site] if model_settings is not None else None) for site in sites}
+    for site in sites:
+        relative = MODEL_SCRIPTS[site]
         if not (root / relative).is_file():
             raise PipelineError(f"Missing {site} model script: {relative}")
     rscript = find_rscript(root)
@@ -28,14 +37,25 @@ def run_pipeline(root: Path, logger: logging.Logger) -> None:
 
     # Lazy import lets main record missing/broken Python dependencies in the log.
     from src.elt import ELT
-    outcome = ELT(root, logger=logger).run()
+    outcome = ELT(workspace, logger=logger).run()
     if outcome.failed:
         logger.warning("ELT rejected %d input files; models will consume accepted DEL artifacts only", outcome.failed)
     logger.info("ELT completed: %d processed, %d skipped, %d rejected",
                 outcome.processed, outcome.skipped, outcome.failed)
-    for site, relative in MODEL_SCRIPTS.items():
+    if strict_inputs and outcome.failed:
+        raise PipelineError("Hay archivos rechazados. Revisa el detalle, corrige los Excel y vuelve a ejecutar.")
+    for site in sites:
+        relative = MODEL_SCRIPTS[site]
+        model_environment = dict(environment)
+        # Never mutate process-wide environment: browser sessions may coexist.
+        model_environment.pop("MIRAI_MODEL_CONFIG", None)
+        if model_settings is not None or data_root is not None:
+            config_path = workspace / ".runtime" / f"{site.lower()}-config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(configurations[site], ensure_ascii=True), encoding="utf-8")
+            model_environment["MIRAI_MODEL_CONFIG"] = str(config_path.resolve())
         run_logged([str(rscript), "--vanilla", str(root / relative)],
-                   label=f"{site} demand model", root=root, logger=logger, env=environment)
+                   label=f"{site} demand model", root=root, logger=logger, env=model_environment)
         logger.info("%s analysis saved in %s", site, configurations[site]["output_directory"])
 
 

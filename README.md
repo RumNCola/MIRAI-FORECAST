@@ -1,6 +1,46 @@
 # MIRAI-FORECAST
 ELT of MIRAI FOOD LAB sales data in order to forecast future demand of various products, considering diverse variables such as seasonality, holidays, weeks of the month among other causes.
 
+## Interfaz para usuarios (Windows)
+
+Haz doble clic en **`iniciar_interfaz.bat`**. Necesitas Python 3.12 o superior;
+la primera apertura necesita Internet para preparar las dependencias Python y R.
+Se abrirá una aplicación local en el navegador. Mantén abierta la consola mientras
+la usas; para cerrarla presiona Ctrl+C en esa consola.
+
+1. Selecciona MUT, Franklin o ambos y arrastra uno o varios Excel por local.
+   MUT requiere la hoja `Sheet1`; Franklin requiere `Detalle`, del reporte de
+   ventas por producto. El reporte Franklin Store (`Detalle de ventas`) no está
+   admitido por el modelo de pronóstico actual. Usa `.xlsx` o `.xlsm`, con
+   períodos que no se superpongan.
+2. Elige los días calendario del horizonte, los días de apertura y el patrón de
+   ventas de cada local. Los valores iniciales corresponden al modelo existente.
+   El horizonte empieza después de la última venta del local, no de la fecha actual.
+3. Pulsa **Generar pronóstico**. Se validan todos los archivos; si alguno es
+   rechazado, corrígelo antes de ejecutar nuevamente. Los registros permiten
+   identificar el problema sin editar código.
+4. Revisa el pronóstico por producto y descarga el Excel de cada local o el ZIP
+   con todos los informes y gráficos. La vista previa requiere la opción Parquet.
+
+Cada carga usa únicamente sus propios archivos y se guarda por separado en
+`out/ejecuciones/<identificador>/`: originales, datos procesados, registros,
+parámetros y resultados. No mezcla archivos con cargas previas ni cambia los
+valores de `settings/config.py`. Los locales se pronostican por separado, no se
+suman sus ventas. Los datos y resultados están excluidos de Git. La aplicación
+escucha solo en `127.0.0.1` y no requiere una cuenta en Streamlit.
+
+Con el entorno preparado también puedes abrirla desde una terminal:
+
+```powershell
+.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+```
+
+El código de la pantalla está en `streamlit_app.py`; el manejo de cargas y
+ejecuciones está en `src/interface.py`. `main.bat` conserva la ejecución habitual
+por consola de ambos modelos. No ejecutes análisis simultáneos: comparten el
+bloqueo del proyecto. Las métricas del modelo son de ajuste histórico y no
+garantizan precisión futura.
+
 # Data MGMT and Privacy
 In order to respect privacy and sensible data management, al files contained within Data folder must be put in the .gitignore and should never be pushed to github.
 

@@ -1,0 +1,21 @@
+[theme]
+base = "light"
+primaryColor = "#D1383A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F9FAFB"
+textColor = "#111827"
+linkColor = "#A82D2F"
+borderColor = "#E5E7EB"
+font = "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+baseRadius = "medium"
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F0F1"
+
+[server]
+address = "127.0.0.1"
+maxUploadSize = 100
+
+[browser]
+gatherUsageStats = false

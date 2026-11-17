@@ -36,13 +36,13 @@ def prepare_python(root: Path, logger: logging.Logger) -> None:
             logger.warning("Python setup state is unreadable; dependencies will be checked again", exc_info=True)
     check = subprocess.run([sys.executable, "-m", "pip", "check"], cwd=root,
                            capture_output=True, text=True, check=False)
-    imports = subprocess.run([sys.executable, "-c", "import polars, openpyxl"], cwd=root,
+    imports = subprocess.run([sys.executable, "-c", "import polars, openpyxl, streamlit"], cwd=root,
                              capture_output=True, text=True, check=False)
     if previous != fingerprint or check.returncode or imports.returncode:
         run_logged([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements)],
                    label="Python dependency installation", root=root, logger=logger)
         run_logged([sys.executable, "-m", "pip", "check"], label="Python dependency verification", root=root, logger=logger)
-        run_logged([sys.executable, "-c", "import polars, openpyxl"],
+        run_logged([sys.executable, "-c", "import polars, openpyxl, streamlit"],
                    label="Python import verification", root=root, logger=logger)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = state_path.with_suffix(".tmp")

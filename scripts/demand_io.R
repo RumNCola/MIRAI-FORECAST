@@ -11,6 +11,15 @@ require_model_packages <- function(packages) {
 
 read_model_config <- function(site, repository_root) {
   require_model_packages("jsonlite")
+  override <- Sys.getenv("MIRAI_MODEL_CONFIG", unset = "")
+  if (nzchar(override)) {
+    config <- jsonlite::fromJSON(override, simplifyVector = TRUE)
+    if (!identical(config$schema_version, 1L) || !identical(config$site, site)) {
+      stop("Unexpected model configuration contract", call. = FALSE)
+    }
+    require_model_packages(config$required_r_packages)
+    return(config)
+  }
   explicit_python <- Sys.getenv("MIRAI_PYTHON", unset = "")
   if (nzchar(explicit_python)) {
     python <- if (file.exists(explicit_python)) explicit_python else Sys.which(explicit_python)

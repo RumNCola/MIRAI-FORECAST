@@ -1,50 +1,34 @@
+# MIRAI | Daily product demand - MUT
+# Shared settings: settings/config.py. Inputs: validated DEL Parquet artifacts.
 
-# MIRAI | Pronostico diario por producto - MUT
-# Instalar una vez: install.packages(c("readxl", "writexl"))
+script_path <- local({
+  sourced <- vapply(sys.frames(), function(frame) {
+    if (is.null(frame$ofile)) "" else as.character(frame$ofile)
+  }, character(1))
+  sourced <- sourced[nzchar(sourced)]
+  if (length(sourced)) tail(sourced, 1L) else {
+    argument <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+    if (length(argument) != 1L) stop("Run this script with Rscript or source()")
+    sub("^--file=", "", argument)
+  }
+})
+repository_root <- normalizePath(file.path(dirname(script_path), ".."), winslash = "/", mustWork = TRUE)
+source(file.path(repository_root, "scripts", "demand_io.R"), local = TRUE)
+context <- load_model_context("MUT", repository_root)
+CONFIG <- context$config
+MODELO <- CONFIG$model
+SOLO_DIA <- identical(MODELO, "dia")
+HORIZONTE <- CONFIG$horizon_days
+SALIDA <- CONFIG$output_directory
 
-# 1. CONFIGURACION -------------------------------------------------------
-ARCHIVO <- "C:/Users/cataa/Downloads/Mirai_scripts_R_descarga/demanda MUT consolidada.xlsx"
-HOJA <- "Demanda Limpia"
-COL_FECHA <- "Fecha"
-COL_PRODUCTO <- "Producto"
-COL_CANTIDAD <- "Cantidad"
-SALIDA <- "C:/Users/cataa/Downloads/Mirai_scripts_R_descarga/resultados/mut"
-
-SOLO_DIA <- TRUE    # TRUE: demanda ~ dia | FALSE: demanda ~ dia + mes
-HORIZONTE <- 28     # Dias calendario futuros
-MODELO <- if (SOLO_DIA) "dia" else "dia_mes_anual"
-
-# 2. LEER DATOS ----------------------------------------------------------
-if (!requireNamespace("readxl", quietly = TRUE) ||
-    !requireNamespace("writexl", quietly = TRUE)) {
-  stop("Instala readxl y writexl")
-}
-
-raw <- readxl::read_excel(ARCHIVO, sheet = HOJA)
-if (!all(c(COL_FECHA, COL_PRODUCTO, COL_CANTIDAD) %in% names(raw))) {
-  stop("Revisa los nombres de las columnas")
-}
-
-fecha <- raw[[COL_FECHA]]
-if (is.numeric(fecha)) fecha <- as.Date(fecha, origin = "1899-12-30")
-datos <- data.frame(
-  fecha = as.Date(fecha),
-  producto = trimws(as.character(raw[[COL_PRODUCTO]])),
-  demanda = as.numeric(raw[[COL_CANTIDAD]])
-)
-if (anyNA(datos) || any(datos$producto == "") || any(datos$demanda < 0)) {
-  stop("El Excel contiene datos invalidos")
-}
-
-# MUT: se consideran lunes a domingo; el archivo ya esta limpio.
-datos <- datos[datos$demanda > 0, ]
-if (!nrow(datos)) stop("No hay ventas para modelar")
+# Keep DEL product names as published; do not infer legacy product groupings.
+datos <- context$data
 
 ventas <- aggregate(demanda ~ fecha + producto, datos, sum)
 fechas_local <- sort(unique(ventas$fecha))
 productos <- sort(unique(ventas$producto))
 
-dias <- c("Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo")
+dias <- weekday_names(CONFIG$operating_weekdays)
 nombre_dia <- function(f) {
   c("Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado")[
     as.POSIXlt(f)$wday + 1]
@@ -59,12 +43,14 @@ calendario <- function(f) {
 
 formula_modelo <- if (SOLO_DIA) demanda ~ dia else demanda ~ dia + mes
 fechas_futuras <- seq(max(fechas_local) + 1, by = "day", length.out = HORIZONTE)
+fechas_futuras <- fechas_futuras[nombre_dia(fechas_futuras) %in% dias]
+if (!length(fechas_futuras)) stop("El horizonte no incluye dias de operacion")
 futuro <- calendario(fechas_futuras)
 
 # 3. REGRESION POR PRODUCTO ----------------------------------------------
-dir.create(SALIDA, recursive = TRUE, showWarnings = FALSE)
-CARPETA_GRAFICOS <- file.path(SALIDA, "graficos")
-dir.create(CARPETA_GRAFICOS, showWarnings = FALSE)
+prepare_output_directories(CONFIG)
+CARPETA_GRAFICOS <- CONFIG$graphs_directory
+
 
 pronosticos <- list(); metricas <- list(); historico <- list()
 coeficientes <- list(); residuos_dia <- list()
@@ -125,7 +111,7 @@ for (i in seq_along(productos)) {
   # Variabilidad residual por dia, si existen al menos 5 observaciones.
   sd_por_dia <- sapply(dias, function(d) {
     e <- residuo[df$dia == d]
-    if (length(e) >= 5) sd(e) else NA_real_
+    if (length(e) >= CONFIG$residual_min_observations) sd(e) else NA_real_
   })
   residuos_dia[[i]] <- data.frame(
     producto = p, dia = dias,
@@ -170,9 +156,10 @@ for (i in seq_along(productos)) {
   )
   
   # 5. GRAFICOS: UNO POR PRODUCTO ----------------------------------------
+  if (isTRUE(CONFIG$generate_plots)) {
   nombre <- substr(gsub("[^A-Za-z0-9_-]", "_", p), 1, 65)
   png(file.path(CARPETA_GRAFICOS, sprintf("%02d_%s.png", i, nombre)),
-      width = 1800, height = 1350, res = 150)
+      width = CONFIG$plot_width, height = CONFIG$plot_height, res = CONFIG$plot_resolution)
   par(mfrow = c(3, 2), mar = c(4, 4, 2.5, 1), oma = c(0, 0, 2.5, 0))
   
   plot(df$fecha, df$demanda, pch = 16, cex = 0.45, col = "grey60",
@@ -208,11 +195,11 @@ for (i in seq_along(productos)) {
        main = "Errores historicos")
   abline(h = 0, col = "firebrick", lty = 2)
   
-  ult <- which(df$fecha >= max(df$fecha) - 45)
+  ult <- which(df$fecha >= max(df$fecha) - CONFIG$history_plot_days)
   plot(range(c(df$fecha[ult], futuro$fecha)),
        range(c(0, df$demanda[ult], estimado[ult], proyectado)),
        type = "n", xlab = "Fecha", ylab = "Unidades",
-       main = "Ultimos 45 dias y pronostico")
+       main = paste("Ultimos", CONFIG$history_plot_days, "dias y pronostico"))
   points(df$fecha[ult], df$demanda[ult], pch = 16, cex = 0.5, col = "grey60")
   lines(df$fecha[ult], estimado[ult], col = "steelblue", lwd = 2)
   lines(futuro$fecha, proyectado, col = "firebrick", lwd = 2, lty = 2)
@@ -224,6 +211,7 @@ for (i in seq_along(productos)) {
                " | WAPE: ", round(wape, 1), "%"),
         side = 3, outer = TRUE, line = 0.6, font = 2, cex = 0.9)
   dev.off()
+  }
 }
 
 # 6. EXCEL Y RESUMEN EN CONSOLA ------------------------------------------
@@ -239,19 +227,18 @@ coeficientes <- if (length(coeficientes)) {
 }
 
 configuracion <- data.frame(
-  parametro = c("Local", "Archivo", "Hoja", "Solo dia", "Modelo solicitado",
+  parametro = c("Local", "Fuente DEL", "Archivos DEL", "Solo dia", "Modelo solicitado",
                 "Modelo dia", "Modelo dia_mes_anual", "Horizonte (dias)",
                 "Dias de operacion", "Criterio de estimacion"),
-  valor = c("MUT", basename(ARCHIVO), HOJA, SOLO_DIA, MODELO,
+  valor = c("MUT", CONFIG$source, paste(context$input_files, collapse = "; "), SOLO_DIA, MODELO,
             "demanda ~ dia", "demanda ~ dia + mes", HORIZONTE,
-            "Lunes a domingo", "Modelo fijo; sin seleccion por BIC")
+            paste(dias, collapse = ", "), "Modelo fijo; sin seleccion por BIC")
 )
-archivo_salida <- file.path(SALIDA, "modelo_demanda_MUT.xlsx")
-writexl::write_xlsx(
+archivo_salida <- write_analysis_outputs(
   list(Configuracion = configuracion, Pronosticos = pronosticos,
        Metricas = metricas, Historico = historico,
        Residuos_por_dia = residuos_dia, Coeficientes = coeficientes),
-  path = archivo_salida
+  context = context
 )
 
 cat("\n========== MUT: RESUMEN ==========\n")
@@ -273,4 +260,6 @@ print(residuos_dia[residuos_dia$producto %in% top,
       row.names = FALSE)
 cat("\nWAPE global:",
     round(100 * sum(abs(historico$residuo)) / sum(historico$observado), 1), "%\n")
-cat("\nExcel:", archivo_salida, "\nGraficos:", CARPETA_GRAFICOS, "\n")
+cat("\nResultados:", SALIDA, "\n")
+if (!is.null(archivo_salida)) cat("Excel:", archivo_salida, "\n")
+if (isTRUE(CONFIG$generate_plots)) cat("Graficos:", CARPETA_GRAFICOS, "\n")

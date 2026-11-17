@@ -16,7 +16,7 @@ from zipfile import ZipFile
 
 import polars as pl
 
-from src.old_elt import ELT, ELTError, IntegrityError, PIPELINE_VERSION, main, _sha256
+from src.elt import ELT, ELTError, IntegrityError, PIPELINE_VERSION, main, _sha256
 
 
 def write_excel_fixture(path, rows, sheet="Sheet1"):
@@ -91,11 +91,11 @@ class ELTTests(unittest.TestCase):
 
     def test_import_does_not_process_or_write(self):
         self.save_mut()
-        copied = self.root / "src" / "old_elt.py"
+        copied = self.root / "src" / "elt.py"
         copied.parent.mkdir()
-        shutil.copyfile(Path(__file__).resolve().parents[1] / "src" / "old_elt.py", copied)
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "src" / "elt.py", copied)
         completed = subprocess.run(
-            [sys.executable, "-c", "import src.old_elt"], cwd=self.root,
+            [sys.executable, "-c", "import src.elt"], cwd=self.root,
             capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(self.elt.log_path.exists())
@@ -289,8 +289,8 @@ class ELTTests(unittest.TestCase):
         self.assertEqual(output.row(0, named=True)["unit_price"], 12500)
 
     def test_cli_works_outside_repository(self):
-        script = Path(__file__).resolve().parents[1] / "src" / "old_elt.py"
-        copied = self.root / "src" / "old_elt.py"
+        script = Path(__file__).resolve().parents[1] / "src" / "elt.py"
+        copied = self.root / "src" / "elt.py"
         copied.parent.mkdir()
         shutil.copyfile(script, copied)
         self.save_mut()
@@ -398,7 +398,7 @@ class ELTTests(unittest.TestCase):
 
     def test_state_write_failure_is_fatal(self):
         self.save_mut()
-        with patch("src.old_elt._atomic_json", side_effect=OSError("State is read-only")):
+        with patch("src.elt._atomic_json", side_effect=OSError("State is read-only")):
             with self.assertRaises(ELTError):
                 self.elt.run()
         events = self.events()
@@ -446,7 +446,7 @@ def guarded(name, *args, **kwargs):
         raise ImportError('Forbidden dependency: ' + name)
     return original_import(name, *args, **kwargs)
 builtins.__import__ = guarded
-from src.old_elt import ELT
+from src.elt import ELT
 assert ELT(sys.argv[1]).run().processed == 1
 '''
         completed = subprocess.run([sys.executable, "-c", program, str(self.root)], cwd=repository,

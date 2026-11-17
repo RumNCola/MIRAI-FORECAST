@@ -5,7 +5,7 @@ All table processing and Parquet I/O use Polars natively. Openpyxl reads the
 Excel cell values and layouts; this pipeline does not use Pandas or PyArrow.
 
 ```python
-from src.old_elt import ELT, ELTError
+from src.elt import ELT, ELTError
 
 try:
     result = ELT().run()
@@ -15,8 +15,8 @@ except ELTError:
 # result.failed counts inputs rejected with WARNING; other inputs still run.
 ```
 
-Importing `old_elt` does not read or write data. The application owns its main
-function. For a standalone batch, run `python src/old_elt.py`. It processes every
+Importing `elt` does not read or write data. The application owns its main
+function. For a standalone batch, run `python src/elt.py`. It processes every
 pending export and continues after recoverable input failures. The main function
 returns 0 after a completed batch, including batches with warnings, or 1 after a
 fatal failure. Paths are relative to the repository containing the module,

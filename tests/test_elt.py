@@ -1,7 +1,8 @@
 """Behavioral tests using synthetic exports; no private RAW data is required."""
 
-import importlib
 import json
+import io
+import logging
 import shutil
 import subprocess
 import sys
@@ -13,9 +14,9 @@ from unittest.mock import patch
 from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
-import pandas as pd
+import polars as pl
 
-from src.old_elt import ELT, IntegrityError, _sha256
+from src.old_elt import ELT, ELTError, IntegrityError, PIPELINE_VERSION, main, _sha256
 
 
 def write_excel_fixture(path, rows, sheet="Sheet1"):
@@ -73,16 +74,16 @@ class ELTTests(unittest.TestCase):
                   "quantity": 2, "order_reference": "001-001", "order_id": "00001",
                   "product_sku": "0013", "status": "pagado", "time": "20:55:45"}
         values.update(changes)
-        return pd.DataFrame([values])
+        return pl.DataFrame([values])
 
     def save_mut(self, frame=None, name="orders.parquet", source="MUT_SALES"):
         path = self.elt.raw_dir / source / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        (self.mut_frame() if frame is None else frame).to_parquet(path, index=False)
+        (self.mut_frame() if frame is None else frame).write_parquet(path)
         return path
 
     def store_frame(self, quantity=-2, movement="Nota de crédito"):
-        return pd.DataFrame([{
+        return pl.DataFrame([{
             "date": "2026-10-01", "category": "Products", "product_name": "CHILI OIL",
             "quantity": quantity, "movement": movement, "document": "NOTA DE CRÉDITO ELECTRÓNICA",
             "document_number": "00001", "variant": None,
@@ -90,24 +91,29 @@ class ELTTests(unittest.TestCase):
 
     def test_import_does_not_process_or_write(self):
         self.save_mut()
-        with patch.object(ELT, "run", side_effect=AssertionError("Unexpected processing")):
-            importlib.import_module("src.old_elt")
+        copied = self.root / "src" / "old_elt.py"
+        copied.parent.mkdir()
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "src" / "old_elt.py", copied)
+        completed = subprocess.run(
+            [sys.executable, "-c", "import src.old_elt"], cwd=self.root,
+            capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(self.elt.log_path.exists())
         self.assertFalse(self.elt.del_dir.exists())
 
     def test_first_run_preserves_names_identifiers_and_repeated_lines(self):
-        frame = pd.concat([self.mut_frame(product_name="KARAAGE KIDS ")] * 2, ignore_index=True)
+        frame = pl.concat([self.mut_frame(product_name="KARAAGE KIDS ")] * 2)
         self.save_mut(frame)
         result = self.elt.run()
         self.assertEqual((result.processed, result.failed), (1, 0))
-        output = pd.read_parquet(self.root / result.files[0].output)
-        self.assertEqual(output["product_name"].tolist(), ["KARAAGE KIDS "] * 2)
-        self.assertEqual(output["product_sku"].tolist(), ["0013"] * 2)
-        self.assertEqual(output["order_id"].tolist(), ["00001"] * 2)
+        output = pl.read_parquet(self.root / result.files[0].output)
+        self.assertEqual(output["product_name"].to_list(), ["KARAAGE KIDS "] * 2)
+        self.assertEqual(output["product_sku"].to_list(), ["0013"] * 2)
+        self.assertEqual(output["order_id"].to_list(), ["00001"] * 2)
         self.assertEqual(output["quantity"].sum(), 4)
-        self.assertEqual(output["source_row"].tolist(), [1, 2])
-        self.assertTrue(pd.api.types.is_datetime64_any_dtype(output["date"]))
-        self.assertTrue(pd.api.types.is_integer_dtype(output["quantity"]))
+        self.assertEqual(output["source_row"].to_list(), [1, 2])
+        self.assertEqual(output.schema["date"], pl.Datetime("us"))
+        self.assertEqual(output.schema["quantity"], pl.Int64)
         codes = {w["code"] for w in result.files[0].warnings}
         self.assertIn("repeated_lines_preserved", codes)
         self.assertIn("surrounding_whitespace_preserved", codes)
@@ -131,9 +137,9 @@ class ELTTests(unittest.TestCase):
         warnings = {w["code"]: w for w in result.files[0].warnings}
         self.assertEqual(warnings["unrecognized_product_names"]["names"], ["Gyosas Vietnam"])
         self.assertEqual(self.log()["product_catalog"]["MUT_SALES"], ["Gyosas vietnam"])
-        output = pd.read_parquet(self.root / result.files[0].output)
-        self.assertEqual(output.iloc[0]["product_name"], "Gyosas Vietnam")
-        self.assertEqual(output.iloc[0]["quantity"], 3)
+        output = pl.read_parquet(self.root / result.files[0].output)
+        self.assertEqual(output.row(0, named=True)["product_name"], "Gyosas Vietnam")
+        self.assertEqual(output.row(0, named=True)["quantity"], 3)
 
     def test_missing_and_corrupted_outputs_are_rebuilt(self):
         self.save_mut()
@@ -143,7 +149,7 @@ class ELTTests(unittest.TestCase):
         self.assertEqual(self.elt.run().processed, 1)
         output.write_bytes(b"broken parquet")
         self.assertEqual(self.elt.run().processed, 1)
-        self.assertEqual(len(pd.read_parquet(output)), 1)
+        self.assertEqual(pl.read_parquet(output).height, 1)
 
     def test_identical_copies_reuse_one_output(self):
         original = self.save_mut()
@@ -182,7 +188,7 @@ class ELTTests(unittest.TestCase):
 
     def test_corrupt_log_and_existing_lock_fail_without_resetting_state(self):
         self.elt.log_path.write_text("invalid json", encoding="utf-8")
-        with self.assertRaises(IntegrityError):
+        with self.assertRaises(ELTError):
             self.elt.run()
         self.assertEqual(self.elt.log_path.read_text(), "invalid json")
         self.assertFalse(self.elt.lock_path.exists())
@@ -201,10 +207,10 @@ class ELTTests(unittest.TestCase):
         write_excel_fixture(path, rows, sheet="Detalle de ventas")
         result = self.elt.run()
         self.assertEqual((result.processed, result.failed), (1, 0))
-        output = pd.read_parquet(self.root / result.files[0].output)
-        self.assertEqual(output["source_row"].tolist(), [7])
-        self.assertEqual(output["quantity"].tolist(), [-2])
-        self.assertEqual(output["document_number"].tolist(), ["0001"])
+        output = pl.read_parquet(self.root / result.files[0].output)
+        self.assertEqual(output["source_row"].to_list(), [7])
+        self.assertEqual(output["quantity"].to_list(), [-2])
+        self.assertEqual(output["document_number"].to_list(), ["0001"])
 
     def test_mut_excel_preserves_populated_unlabeled_column_and_skips_lock(self):
         path = self.elt.raw_dir / "MUT_SALES" / "mut.xlsx"
@@ -215,8 +221,8 @@ class ELTTests(unittest.TestCase):
         path.with_name("~$mut.xlsx").write_bytes(b"not an Excel file")
         result = self.elt.run()
         self.assertEqual((result.processed, result.failed), (1, 0))
-        output = pd.read_parquet(self.root / result.files[0].output)
-        self.assertEqual(output["source_unlabeled_9"].tolist(), ["device-001"])
+        output = pl.read_parquet(self.root / result.files[0].output)
+        self.assertEqual(output["source_unlabeled_9"].to_list(), ["device-001"])
 
     def test_excel_errors_and_duplicate_headers_fail(self):
         path = self.elt.raw_dir / "MUT_SALES" / "invalid.xlsx"
@@ -229,14 +235,14 @@ class ELTTests(unittest.TestCase):
                 self.assertFalse(self.elt.del_dir.exists())
 
     def test_ranking_mismatch_and_daily_duplicate_keys_fail(self):
-        frame = pd.DataFrame([{"date": datetime(2026, 10, 1), "category": "Food", "subcategory": "Lunch",
+        frame = pl.DataFrame([{"date": datetime(2026, 10, 1), "category": "Food", "subcategory": "Lunch",
                                "product_name": "Item", "quantity": 2}])
         clean = self.elt.clean_franklin_sales(frame)
-        ranking = frame.drop(columns="date").assign(quantity=3)
+        ranking = frame.drop("date").with_columns(pl.lit(3).alias("quantity"))
         with self.assertRaisesRegex(IntegrityError, "reconcile"):
             self.elt._audit(frame, clean, "FRANKLIN_SALES", {"ranking": ranking}, None)
         with self.assertRaisesRegex(IntegrityError, "Duplicate daily"):
-            self.elt.clean_franklin_sales(pd.concat([frame, frame], ignore_index=True))
+            self.elt.clean_franklin_sales(pl.concat([frame, frame]))
 
     def test_catalog_bootstraps_entire_batch_and_overlap_is_reported(self):
         self.save_mut()
@@ -246,6 +252,41 @@ class ELTTests(unittest.TestCase):
         codes = {w["code"] for item in result.files for w in item.warnings}
         self.assertIn("overlapping_export_period", codes)
         self.assertNotIn("unrecognized_product_names", codes)
+
+    def test_partial_batch_defers_catalog_until_source_succeeds(self):
+        self.save_mut()
+        self.save_mut(self.mut_frame(quantity=-1), name="second.parquet")
+        self.assertEqual(self.elt.run().failed, 1)
+        self.assertNotIn("MUT_SALES", self.log()["product_catalog"])
+        self.save_mut(self.mut_frame(product_name="Second item"), name="second.parquet")
+        self.assertEqual(self.elt.run().failed, 0)
+        self.assertEqual(self.log()["product_catalog"]["MUT_SALES"], ["Gyosas vietnam", "Second item"])
+
+    def test_failed_parquet_write_is_not_marked_processed(self):
+        self.save_mut()
+        with patch.object(ELT, "_write_parquet", side_effect=OSError("Disk full")):
+            with self.assertRaises(ELTError):
+                self.elt.run()
+        record = next(iter(self.log()["files"].values()))
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(self.elt.run().processed, 1)
+
+    def test_store_summary_counts_fail_and_auxiliary_formula_errors_warn(self):
+        original = self.store_frame()
+        cleaned = self.elt.clean_franklin_store(original)
+        with self.assertRaisesRegex(IntegrityError, "summary does not reconcile"):
+            self.elt._audit(original, cleaned, "FRANKLIN_STORE", {"summary": {"filas de detalle": 100}}, None)
+        report = self.elt._audit(original, cleaned, "FRANKLIN_STORE",
+                                 {"summary": {"filas de detalle": 1}, "summary_errors": 3}, None)
+        self.assertIn("excel_errors_in_auxiliary_summary", {w["code"] for w in report["warnings"]})
+
+    def test_mut_store_alias_and_optional_monetary_columns(self):
+        self.save_mut(self.mut_frame(currency="CLP", unit_price=12500, total_amount=25000), source="MUT_STORE")
+        result = self.elt.run()
+        self.assertEqual((result.processed, result.failed), (1, 0))
+        output = pl.read_parquet(self.root / result.files[0].output)
+        self.assertEqual(output.row(0, named=True)["source"], "MUT_STORE")
+        self.assertEqual(output.row(0, named=True)["unit_price"], 12500)
 
     def test_cli_works_outside_repository(self):
         script = Path(__file__).resolve().parents[1] / "src" / "old_elt.py"
@@ -257,6 +298,160 @@ class ELTTests(unittest.TestCase):
                                    capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("1 processed", completed.stderr)
+
+    def events(self):
+        return (self.root / "elt.log").read_text(encoding="utf-8")
+
+    def test_output_uses_only_parquet_extension(self):
+        path = self.elt.raw_dir / "MUT_SALES" / "sales.xlsx"
+        headers = ["Fecha", "Categoría", "Producto", "Cantidad", "Correlativo", "#Orden", "SKU producto", "Estado"]
+        write_excel_fixture(path, [headers, ["2026-10-01", "Food", "Item", 1, "001", "001", "013", "pagado"]])
+        result = self.elt.run()
+        self.assertEqual(result.files[0].output, "Data/DEL/MUT_SALES/sales.parquet")
+        self.assertFalse(list(self.elt.del_dir.rglob("*.xlsx.parquet")))
+
+    def test_legacy_output_is_migrated_without_losing_catalog(self):
+        self.save_mut()
+        first = self.elt.run()
+        output = self.root / first.files[0].output
+        legacy = output.with_name("orders.parquet.parquet")
+        output.rename(legacy)
+        log = self.log()
+        record = next(iter(log["files"].values()))
+        record["output"] = legacy.relative_to(self.root).as_posix()
+        record["pipeline_version"] = "1"
+        self.elt.log_path.write_text(json.dumps(log), encoding="utf-8")
+        result = self.elt.run()
+        self.assertEqual((result.processed, result.failed), (1, 0))
+        self.assertTrue(output.is_file())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.log()["product_catalog"], log["product_catalog"])
+        self.assertEqual(next(iter(self.log()["files"].values()))["pipeline_version"], PIPELINE_VERSION)
+        self.assertIn("Legacy output retired", self.events())
+
+    def test_modified_legacy_output_is_retained_with_warning(self):
+        self.save_mut()
+        first = self.elt.run()
+        output = self.root / first.files[0].output
+        legacy = output.with_name("orders.parquet.parquet")
+        output.rename(legacy)
+        log = self.log()
+        record = next(iter(log["files"].values()))
+        record.update(output=legacy.relative_to(self.root).as_posix(), pipeline_version="1")
+        self.elt.log_path.write_text(json.dumps(log), encoding="utf-8")
+        legacy.write_bytes(b"manually modified")
+        self.assertEqual(self.elt.run().processed, 1)
+        self.assertEqual(legacy.read_bytes(), b"manually modified")
+        self.assertIn("WARNING", self.events())
+        self.assertIn("Legacy output was modified", self.events())
+
+    def test_colliding_stems_stop_before_publication(self):
+        path = self.save_mut()
+        path.with_suffix(".xlsx").write_bytes(b"same output stem")
+        with self.assertRaisesRegex(ELTError, "collision"):
+            self.elt.run()
+        self.assertFalse(self.elt.del_dir.exists())
+        events = self.events()
+        self.assertIn("ERROR", events)
+        self.assertNotIn("Output names validated completed", events)
+        self.assertNotIn("Batch completed", events)
+
+    def test_recoverable_failure_logs_warning_and_continues(self):
+        self.save_mut(self.mut_frame(quantity=-1), name="a_bad.parquet")
+        self.save_mut(name="b_good.parquet")
+        result = self.elt.run()
+        self.assertEqual((result.failed, result.processed), (1, 1))
+        events = self.events()
+        self.assertIn("WARNING", events)
+        self.assertIn("Rejected export; batch continues", events)
+        self.assertNotIn("ERROR", events)
+        self.assertNotIn("Input cleaned [Data/RAW/MUT_SALES/a_bad.parquet] completed", events)
+        self.assertIn("Processed export: Data/RAW/MUT_SALES/b_good.parquet", events)
+        self.assertIn("Batch completed", events)
+
+    def test_quality_warnings_still_allow_success_milestones(self):
+        self.save_mut(pl.concat([self.mut_frame()] * 2))
+        self.assertEqual(self.elt.run().processed, 1)
+        events = self.events()
+        self.assertIn('"code": "repeated_lines_preserved"', events)
+        self.assertIn("WARNING", events)
+        self.assertIn("Parquet published [Data/RAW/MUT_SALES/orders.parquet] completed", events)
+        self.assertIn("Processed export:", events)
+        self.assertNotIn("ERROR", events)
+
+    def test_fatal_write_logs_error_stops_and_omits_success_milestones(self):
+        self.save_mut(name="a_first.parquet")
+        self.save_mut(name="b_later.parquet")
+        with patch.object(ELT, "_write_parquet", side_effect=OSError("Disk full")):
+            with self.assertRaises(ELTError):
+                self.elt.run()
+        events = self.events()
+        self.assertIn("ERROR", events)
+        self.assertIn("Disk full", events)
+        self.assertIn("Input loaded [Data/RAW/MUT_SALES/a_first.parquet] completed", events)
+        self.assertNotIn("Parquet published [Data/RAW/MUT_SALES/a_first.parquet] completed", events)
+        self.assertNotIn("Processed export:", events)
+        self.assertNotIn("b_later.parquet", events)
+        self.assertNotIn("Batch completed", events)
+        self.assertEqual(next(iter(self.log()["files"].values()))["severity"], "ERROR")
+        self.assertFalse(self.elt.lock_path.exists())
+
+    def test_state_write_failure_is_fatal(self):
+        self.save_mut()
+        with patch("src.old_elt._atomic_json", side_effect=OSError("State is read-only")):
+            with self.assertRaises(ELTError):
+                self.elt.run()
+        events = self.events()
+        self.assertIn("ERROR", events)
+        self.assertIn("State is read-only", events)
+        self.assertNotIn("Processed export:", events)
+        self.assertNotIn("Batch completed", events)
+
+    def test_unexpected_processing_exception_is_fatal(self):
+        self.save_mut()
+        with patch.object(ELT, "clean_mut_sales", side_effect=TypeError("Unexpected bug")):
+            with self.assertRaises(ELTError):
+                self.elt.run()
+        self.assertIn("ERROR", self.events())
+        self.assertNotIn("Input cleaned [Data/RAW/MUT_SALES/orders.parquet] completed", self.events())
+
+    def test_main_returns_zero_for_warnings_and_one_for_fatal_failure(self):
+        self.save_mut(self.mut_frame(quantity=-1))
+        with patch("sys.stderr", new_callable=io.StringIO) as console:
+            self.assertEqual(main(self.root), 0)
+            self.elt.log_path.write_text("broken history", encoding="utf-8")
+            self.assertEqual(main(self.root), 1)
+        self.assertIn("ERROR", console.getvalue())
+        self.assertIn("ERROR", self.events())
+
+    def test_injected_logger_gets_events_without_duplicate_handlers(self):
+        self.save_mut()
+        logger = logging.getLogger(f"test.elt.{self.root.name}")
+        handlers = list(logger.handlers)
+        instance = ELT(self.root, logger=logger)
+        instance.run()
+        instance.run()
+        self.assertEqual(logger.handlers, handlers)
+        events = self.events()
+        self.assertEqual(events.count("Batch started;"), 2)
+        self.assertEqual(events.count("Batch completed:"), 2)
+
+    def test_pipeline_does_not_require_pandas_or_pyarrow(self):
+        self.save_mut()
+        repository = Path(__file__).resolve().parents[1]
+        program = '''import builtins, sys
+original_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.split('.')[0] in {'pandas', 'pyarrow'}:
+        raise ImportError('Forbidden dependency: ' + name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+from src.old_elt import ELT
+assert ELT(sys.argv[1]).run().processed == 1
+'''
+        completed = subprocess.run([sys.executable, "-c", program, str(self.root)], cwd=repository,
+                                   capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

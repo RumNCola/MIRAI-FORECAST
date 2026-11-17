@@ -1,4 +1,11 @@
-pandas>=2.2,<4
-openpyxl>=3.1,<4
-pyarrow>=18,<27
-tzdata>=2024.1
+dotenv==0.9.9
+et_xmlfile==2.0.0
+numpy==2.5.5
+openpyxl==3.1.5
+pathlib==1.0.1
+polars==2.1.0
+polars-runtime-32==2.1.0
+pyarrow==26.0.1
+python-dateutil==4.0.0
+python-dotenv==1.2.4
+tzdata==2026.6

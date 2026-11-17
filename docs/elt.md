@@ -1,19 +1,25 @@
 # RAW-to-DEL processing
 
 Use Python 3.11 or newer. Install the dependencies with `python -m pip install -r requirements.txt`.
+All table processing and Parquet I/O use Polars natively. Openpyxl reads the
+Excel cell values and layouts; this pipeline does not use Pandas or PyArrow.
 
 ```python
-from src.old_elt import ELT
+from src.old_elt import ELT, ELTError
 
-result = ELT().run()
-if result.failed:
-    raise RuntimeError(f"{result.failed} exports failed validation")
+try:
+    result = ELT().run()
+except ELTError:
+    # The fatal exception and traceback have already been written to elt.log.
+    raise
+# result.failed counts inputs rejected with WARNING; other inputs still run.
 ```
 
 Importing `old_elt` does not read or write data. The application owns its main
 function. For a standalone batch, run `python src/old_elt.py`. It processes every
-pending export, continues after individual file failures, and exits with code 1
-if any file fails. Paths are relative to the repository containing the module,
+pending export and continues after recoverable input failures. The main function
+returns 0 after a completed batch, including batches with warnings, or 1 after a
+fatal failure. Paths are relative to the repository containing the module,
 independent of the working directory. Tests may supply `ELT(repository_root=...)`.
 
 ## Input formats
@@ -38,16 +44,27 @@ columns. It must contain an export table without DEL provenance columns.
 
 ## Output and preserved values
 
-Each export produces `Data/DEL/<source>/<relative-input-filename>.parquet` with
-Snappy compression. The input extension stays in the filename to prevent Excel
-and Parquet inputs with the same stem from colliding. The source directory and
-any nested directories are preserved. RAW files are never overwritten.
+Each export produces `Data/DEL/<source>/<relative-input-stem>.parquet` with
+Snappy compression. For example, `sales.xlsx` produces `sales.parquet`, and
+`sales.parquet` in RAW also produces `sales.parquet` in DEL. The source directory
+and any nested directories are preserved. RAW files are never overwritten.
+Inputs with the same destination (for example, `sales.xlsx` and `sales.parquet`
+in the same RAW directory) stop the batch before publication; rename one input
+or use separate subdirectories.
+
+Pipeline version 2 regenerates the previous double-extension outputs. After the
+new artifact and processing state have been saved successfully, a legacy
+`.xlsx.parquet`, `.xlsm.parquet` or `.parquet.parquet` file is retired only when
+its path and hash match the previous processing record and no current file record
+still references it. A modified legacy file is retained with a warning.
 
 Columns use English names such as `date`, `category`, `subcategory`,
 `product_name`, `quantity`, `order_id`, `product_sku`, `movement` and `variant`.
 Dates are timestamps without a timezone; quantities are signed 64-bit integers;
 available monetary amounts are numeric; identifiers and other attributes are
-strings. Product names, capitalization, accents, whitespace and variants are
+strings. Dates use Polars `Datetime("us")`, quantities use `Int64`, monetary
+amounts use `Float64`, and textual attributes use `String`. Product names,
+capitalization, accents, whitespace and variants are
 preserved. Leading zeroes in identifiers are preserved when stored as text in
 RAW; an Excel numeric cell cannot recover zeroes that were already discarded.
 Populated columns without a header are retained as `source_unlabeled_<position>`.
@@ -60,11 +77,11 @@ to the prepared table before it atomically replaces the destination.
 
 ## Integrity checks
 
-Publication fails for missing sheets or required columns, duplicate headers,
+An individual input is rejected with a warning for missing sheets or required columns, duplicate headers,
 reserved provenance columns in RAW, empty detail tables, missing required values,
 non-text products/categories, invalid or ambiguous date formats, non-finite
 numbers, fractional or zero unit counts, invalid MUT times/currency, or Excel
-errors in detail/control tables. Dates accept native Excel dates, ISO dates,
+errors in detail/control tables. The remaining inputs continue. Dates accept native Excel dates, ISO dates,
 `DD/MM/YYYY`, `DD-MM-YYYY` and `YYYY/MM/DD`; unformatted Excel serial numbers and
 dates with time components are rejected.
 
@@ -90,12 +107,33 @@ is inferred from that broken summary.
 
 ## Processing log and product catalog
 
+`elt.log` is the append-only event log in the repository root. It includes
+timestamps, severity, file context and exception tracebacks. The standalone
+`main()` owns a logger that also writes to the console. Library calls to
+`ELT().run()` attach the same file logging automatically; applications can inject
+their logger with `ELT(logger=logger)`. Each run closes only the handlers it owns.
+
+| Level | Meaning | Effect |
+| --- | --- | --- |
+| `INFO` | A stage or relevant milestone completed successfully | Continue. |
+| `WARNING` | A recoverable failure or data-quality finding | Continue; reject the affected input when it cannot be validated. |
+| `ERROR` | A failure that makes continued execution unsafe | Stop immediately and raise `ELTError`; standalone main returns 1. |
+
+Stage boundaries use `try/except/else`. A success milestone is emitted from the
+`else` only after the stage finishes without a fatal exception. Warnings do not
+prevent successful milestones. No file-processing or batch-success milestone is
+emitted after its fatal failure. Fatal causes include unreadable/corrupt state,
+output collisions, execution-lock conflicts, Parquet publication or verification
+failures, state-persistence failures, and unexpected programming exceptions.
+If `elt.log` itself cannot be opened or written, execution also stops; main uses
+stderr as the fallback because the unavailable file cannot record that failure.
+
 `elt_log.json` in the repository root contains one current record per input path:
 source/output SHA-256 hashes, pipeline version, processing timestamp, output path,
 row counts, quantity totals, date ranges, null counts, exact product names and
-warnings. Failed files record their error and retain the previous successful
+warnings. Failed files record their error/severity and retain the previous successful
 record under `last_success`, when available. Last-run counts are also recorded.
-The log and `Data/` are excluded from Git because they contain private metadata.
+Both logs and `Data/` are excluded from Git because they contain private metadata.
 
 The first fully successful batch for each source saves **all its exact current
 product names** as that source's `product_catalog`. It does not adopt the old
@@ -128,4 +166,6 @@ does not automatically delete DEL or its log records.
 python -m unittest discover -s tests -v
 ```
 
-Tests use synthetic Excel and Parquet inputs, requiring no private data.
+Tests use synthetic Excel and Parquet inputs, requiring no private data. They
+cover native Polars execution without Pandas/PyArrow, output-name migration,
+recoverable/fatal exceptions and the ordering of log milestones.

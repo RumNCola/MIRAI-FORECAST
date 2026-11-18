@@ -10,3 +10,4 @@ python-dateutil==4.0.0
 python-dotenv==1.2.4
 tzdata==2026.6
 streamlit==1.67.0
+reportlab==5.0.1

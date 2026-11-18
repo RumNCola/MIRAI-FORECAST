@@ -33,6 +33,27 @@ INVENTORY_PARAMETER_SHEETS = {
     "composicion": ("local", "producto", "ingrediente", "cantidad_por_plato", "fuente"),
 }
 
+# Production report (PDF) for the central kitchen: see src/report.py.
+# Editable mapping "producto -> grupo -> variante"; one PDF page per group, in sheet order.
+REPORT_GROUPS_WORKBOOK = "settings/reporte_grupos.xlsx"
+REPORT_GROUPS_SHEET = "grupos"
+REPORT_GROUPS_COLUMNS = ("local", "producto", "grupo", "variante", "nota")
+REPORT_EXCLUDED_GROUP = "NO INCLUIR"
+# The report needs every location the kitchen supplies (Franklin Store joins once it has a model).
+REPORT_SITES = ("MUT", "FRANKLIN")
+REPORT_OUTPUT_SUBDIRECTORY = "reporte"
+# Traffic light: |forecast vs last 7 days of sales| below the first value = stable (green),
+# up to the second = yellow, above = red.
+REPORT_TREND_THRESHOLDS = (0.15, 0.30)
+REPORT_STALE_DATA_DAYS = 7
+# Products with no sales in the last N days of a site's data (discontinued or renamed dishes): the demand
+# models keep forecasting old names, so the production report and the inventory model both leave them out.
+INACTIVE_PRODUCT_DAYS = 14
+REPORT_INACTIVE_DAYS = INACTIVE_PRODUCT_DAYS
+# Production cycles: (label, ISO weekdays). Cycle 1 Friday-Monday, cycle 2 Tuesday-Thursday.
+REPORT_CYCLES = (("Vie–Lun", (5, 6, 7, 1)), ("Mar–Jue", (2, 3, 4)))
+REPORT_WEEK_START = 5  # The default report week runs Friday to Thursday.
+
 
 @dataclass(frozen=True)
 class ModelSettings:
@@ -237,7 +258,7 @@ def get_inventory_config(model_settings: dict[str, ModelSettings] | None = None,
     return {
         **asdict(settings), "schema_version": 1, "model": "inventory",
         "repository_root": root.as_posix(), "sites": entries,
-        "parameters_workbook": workbook.resolve().as_posix(),
+        "parameters_workbook": workbook.resolve().as_posix(), "inactive_days": INACTIVE_PRODUCT_DAYS,
         "parameter_sheets": {name: list(columns) for name, columns in INVENTORY_PARAMETER_SHEETS.items()},
         "output_directory": output.as_posix(), "workbook_filename": "modelo_inventario.xlsx",
         "required_r_packages": packages,

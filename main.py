@@ -1,14 +1,19 @@
-"""Run incremental ELT, the Franklin and MUT demand models, then the inventory model."""
+"""Run incremental ELT, the Franklin and MUT demand models, the inventory model and the production report.
+
+Usage: main.bat [--comenzar-hoy]   (the report starts today instead of next Friday)
+"""
 
 from __future__ import annotations
 
 import logging
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
-from settings.config import (CRAN_MIRROR, INVENTORY_PARAMETERS_WORKBOOK, INVENTORY_SCRIPT, MODEL_SCRIPTS,
-                             REPOSITORY_ROOT, InventorySettings, InventorySiteSettings, ModelSettings,
+from settings.config import (CRAN_MIRROR, INVENTORY_PARAMETERS_WORKBOOK, INVENTORY_SCRIPT, INVENTORY_SETTINGS,
+                             MODEL_SCRIPTS, REPORT_GROUPS_WORKBOOK, REPOSITORY_ROOT, InventorySettings,
+                             InventorySiteSettings, ModelSettings,
                              get_inventory_config, get_model_config, load_user_defaults, user_defaults_path)
 from src.runtime import PipelineError, find_rscript, pipeline_lock, pipeline_logger, r_environment, run_logged
 
@@ -18,8 +23,13 @@ def run_pipeline(root: Path, logger: logging.Logger, *,
                  data_root: Path | None = None, strict_inputs: bool = False,
                  inventory_settings: InventorySettings | None = None,
                  inventory_sites: dict[str, InventorySiteSettings] | None = None,
-                 parameters_workbook: Path | None = None) -> None:
-    """Validate runtime/configuration before starting the ordered application flow."""
+                 parameters_workbook: Path | None = None,
+                 report_start_today: bool = False, report_today: date | None = None) -> Path | None:
+    """Validate runtime/configuration before starting the ordered application flow.
+
+    Returns the production report (PDF) when it could be generated, otherwise None; the reason is
+    logged and saved in out/reporte/estado.json.
+    """
     if model_settings is not None and not model_settings:
         raise ValueError("Select at least one site")
     sites = tuple(model_settings) if model_settings is not None else tuple(MODEL_SCRIPTS)
@@ -72,6 +82,16 @@ def run_pipeline(root: Path, logger: logging.Logger, *,
         run_logged([str(rscript), "--vanilla", str(root / relative)],
                    label=f"{site} demand model", root=root, logger=logger, env=model_environment)
         logger.info("%s analysis saved in %s", site, configurations[site]["output_directory"])
+    # Production report for the central kitchen: needs MUT and Franklin from this same run. It only
+    # uses the demand outputs, so it runs before the inventory: a broken parameters workbook must
+    # not leave the kitchen without its PDF.
+    from src.report import generate_report
+    report = generate_report(
+        workspace, {site: (Path(configurations[site]["output_directory"]), configurations[site]["workbook_filename"])
+                    for site in sites},
+        root / REPORT_GROUPS_WORKBOOK, logger,
+        service_level=(inventory_settings or INVENTORY_SETTINGS).default_service_level,
+        today=report_today, start_today=report_start_today)
     if inventory is not None:
         config_path = workspace / ".runtime" / "inventory-config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,9 +102,10 @@ def run_pipeline(root: Path, logger: logging.Logger, *,
         run_logged([str(rscript), "--vanilla", str(root / INVENTORY_SCRIPT)],
                    label="Inventory model", root=root, logger=logger, env=inventory_environment)
         logger.info("Inventory analysis saved in %s", inventory["output_directory"])
+    return report
 
 
-def main(repository_root: str | Path | None = None) -> int:
+def main(repository_root: str | Path | None = None, *, report_start_today: bool = False) -> int:
     try:
         root = Path(repository_root).resolve() if repository_root is not None else REPOSITORY_ROOT
         with pipeline_logger(root) as logger:
@@ -96,9 +117,10 @@ def main(repository_root: str | Path | None = None) -> int:
                         defaults = load_user_defaults(root)
                         logger.info("Using saved defaults from %s", user_defaults_path(root).name)
                         run_pipeline(root, logger, model_settings=defaults.model_settings,
-                                     inventory_settings=defaults.inventory, inventory_sites=defaults.inventory_sites)
+                                     inventory_settings=defaults.inventory, inventory_sites=defaults.inventory_sites,
+                                     report_start_today=report_start_today)
                     else:
-                        run_pipeline(root, logger)
+                        run_pipeline(root, logger, report_start_today=report_start_today)
             except (Exception, KeyboardInterrupt) as exc:
                 logger.error("Analysis pipeline stopped: %s", exc, exc_info=True)
                 return 1
@@ -111,4 +133,8 @@ def main(repository_root: str | Path | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unknown = [argument for argument in sys.argv[1:] if argument != "--comenzar-hoy"]
+    if unknown:
+        print(f"ERROR: Unknown option {unknown[0]}. Usage: main.bat [--comenzar-hoy]", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(main(report_start_today="--comenzar-hoy" in sys.argv[1:]))

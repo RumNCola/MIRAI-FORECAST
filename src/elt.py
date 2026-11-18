@@ -307,6 +307,15 @@ class ELT:
                        if p.is_dir() and p.name not in SOURCES and not p.name.startswith(".")]
             if unknown:
                 raise ELTError(f"Unknown RAW source directories: {', '.join(sorted(unknown))}")
+            loose = sorted(p.name for p in self.raw_dir.iterdir()
+                           if p.is_file() and p.suffix.lower() in EXTENSIONS and not p.name.startswith(("~$", ".")))
+            if loose:
+                # Files directly in Data/RAW are never read; say where they belong instead of failing later.
+                raise ELTError(
+                    "Hay archivos sueltos en Data/RAW que no se procesan: " + "; ".join(loose) + ". "
+                    "Mueve cada Excel a la carpeta de su fuente: Data/RAW/MUT_SALES (ventas MUT), "
+                    "Data/RAW/FRANKLIN_SALES (ventas Franklin), Data/RAW/FRANKLIN_STORE (tienda Franklin) "
+                    "o Data/RAW/MUT_STORE.")
             files = []
             for source in SOURCES:
                 directory = self.raw_dir / source

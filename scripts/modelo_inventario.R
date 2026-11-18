@@ -72,6 +72,9 @@ normalize_name <- function(x) {
 }
 
 # 2. PARAMETERS WORKBOOK ---------------------------------------------------------------
+# Excel cells are read as text: accept a decimal comma ("2,5"), as the interface validator does.
+parse_number <- function(x) suppressWarnings(as.numeric(sub(",", ".", trimws(as.character(x)), fixed = TRUE)))
+
 read_parameters <- function(config) {
   path <- config$parameters_workbook
   if (!file.exists(path)) stop("Inventory parameters workbook not found: ", path, call. = FALSE)
@@ -89,23 +92,28 @@ read_parameters <- function(config) {
   }
   vida <- tables$vida_util
   vida$ingrediente <- trimws(vida$ingrediente)
-  vida$vida_util_dias <- suppressWarnings(as.numeric(vida$vida_util_dias))
+  shelf_text <- trimws(as.character(vida$vida_util_dias))
+  vida$vida_util_dias <- parse_number(shelf_text)
   if (anyNA(vida$ingrediente) || any(!nzchar(vida$ingrediente))) stop("vida_util: empty ingredient name", call. = FALSE)
   if (any(duplicated(tolower(vida$ingrediente)))) {
     stop("vida_util: repeated ingredients: ", paste(unique(vida$ingrediente[duplicated(tolower(vida$ingrediente))]),
                                                      collapse = ", "), call. = FALSE)
   }
-  if (any(!is.na(vida$vida_util_dias) & vida$vida_util_dias <= 0)) {
-    stop("vida_util: vida_util_dias must be positive or empty", call. = FALSE)
+  # A typed value must be a finite positive number: text, NaN and Inf are rejected, not taken as empty.
+  bad_shelf <- !is.na(shelf_text) & nzchar(shelf_text) &
+    (is.na(vida$vida_util_dias) | !is.finite(vida$vida_util_dias) | vida$vida_util_dias <= 0)
+  if (any(bad_shelf)) {
+    stop("vida_util: vida_util_dias must be a positive number or empty (", paste(vida$ingrediente[bad_shelf],
+         collapse = ", "), ")", call. = FALSE)
   }
   comp <- tables$composicion
   comp$local <- toupper(trimws(comp$local))
   comp$ingrediente <- trimws(comp$ingrediente)
-  comp$cantidad_por_plato <- suppressWarnings(as.numeric(comp$cantidad_por_plato))
+  comp$cantidad_por_plato <- parse_number(comp$cantidad_por_plato)
   if (anyNA(comp$producto) || anyNA(comp$ingrediente) || any(!comp$local %in% c("FRANKLIN", "MUT", "AMBOS"))) {
     stop("composicion: every row needs local (FRANKLIN, MUT or AMBOS), producto and ingrediente", call. = FALSE)
   }
-  if (anyNA(comp$cantidad_por_plato) || any(comp$cantidad_por_plato <= 0)) {
+  if (anyNA(comp$cantidad_por_plato) || any(!is.finite(comp$cantidad_por_plato) | comp$cantidad_por_plato <= 0)) {
     stop("composicion: cantidad_por_plato must be a positive number", call. = FALSE)
   }
   unknown <- setdiff(tolower(comp$ingrediente), tolower(vida$ingrediente))
@@ -113,6 +121,12 @@ read_parameters <- function(config) {
     stop("composicion uses ingredients missing from vida_util: ", paste(unknown, collapse = ", "), call. = FALSE)
   }
   comp$clave <- normalize_name(comp$producto)
+  repeated <- duplicated(data.frame(comp$local, comp$clave, tolower(comp$ingrediente)))
+  if (any(repeated)) {
+    stop("composicion: the same local, producto and ingrediente appear more than once: ",
+         paste(unique(paste0(comp$producto[repeated], " / ", comp$ingrediente[repeated], " (", comp$local[repeated], ")")),
+               collapse = "; "), call. = FALSE)
+  }
   list(vida = vida, comp = comp)
 }
 
@@ -127,8 +141,25 @@ read_forecasts <- function(site) {
   out <- data.frame(fecha = as.Date(raw$fecha), producto = as.character(raw$producto),
                     mu = as.numeric(raw$demanda_predicha), sigma = as.numeric(raw$sigma_utilizada),
                     stringsAsFactors = FALSE)
-  out$sigma[is.na(out$sigma)] <- 0
   if (anyNA(out$fecha) || anyNA(out$mu)) stop("Invalid forecasts in ", path, call. = FALSE)
+  # Unknown spread (e.g. a product with a single observation): never assume zero uncertainty;
+  # use the Poisson approximation for counts, variance = expected demand.
+  unknown_sigma <- is.na(out$sigma) | !is.finite(out$sigma)
+  out$sigma[unknown_sigma] <- sqrt(pmax(out$mu[unknown_sigma], 0))
+  # Same rule as the production report: a product without sales in the last inactive_days days of
+  # the site's data is discontinued or renamed, although the demand model still forecasts it.
+  out$activo <- TRUE
+  if (!is.null(CONFIG$inactive_days) && "Historico" %in% readxl::excel_sheets(path)) {
+    history <- as.data.frame(readxl::read_excel(path, sheet = "Historico"))
+    if (all(c("fecha", "producto", "observado") %in% names(history)) && nrow(history)) {
+      history$fecha <- as.Date(history$fecha)
+      last <- max(history$fecha, na.rm = TRUE)
+      recent <- history$fecha > last - CONFIG$inactive_days & suppressWarnings(as.numeric(history$observado)) > 0
+      # Exact names, as in the report: the demand model forecasts each spelling from its own history,
+      # so an old spelling stays inactive even when a similar new one sells.
+      out$activo <- out$producto %in% history$producto[recent %in% TRUE]
+    }
+  }
   out$clave <- normalize_name(out$producto)
   out
 }
@@ -167,14 +198,25 @@ parameters <- read_parameters(CONFIG)
 vida <- parameters$vida
 z_ci <- qnorm(1 - (1 - CONFIG$confidence_level) / 2)
 policy <- list(); weekly <- list(); weekly_dish <- list(); unmatched <- list(); uncovered <- list()
+inactive <- list()
 
 for (site in CONFIG$sites) {
   forecasts <- read_forecasts(site)
+  if (any(!forecasts$activo)) {
+    gone <- forecasts[!forecasts$activo, ]
+    inactive[[site$site]] <- aggregate(mu ~ producto, gone, sum)
+    inactive[[site$site]]$local <- site$site
+    message("Aviso: ", length(unique(gone$producto)), " productos de ", site$site, " sin ventas en los ultimos ",
+            CONFIG$inactive_days, " dias quedan fuera del inventario")
+    forecasts <- forecasts[forecasts$activo, ]
+  }
   comp <- parameters$comp[parameters$comp$local %in% c(site$site, "AMBOS"), ]
-  comp <- comp[!duplicated(comp[, c("clave", "ingrediente")]), ]
+  # A row for this site overrides the AMBOS row of the same dish and ingredient, whatever the row order.
+  comp <- comp[order(comp$local == "AMBOS"), ]
+  comp <- comp[!duplicated(data.frame(comp$clave, tolower(comp$ingrediente))), ]
   matched <- merge(forecasts, comp[, c("clave", "ingrediente", "cantidad_por_plato")], by = "clave")
   missing <- setdiff(unique(forecasts$clave), comp$clave)
-  if (length(missing)) {
+  if (length(missing) && nrow(forecasts)) {
     lost <- forecasts[forecasts$clave %in% missing, ]
     unmatched[[site$site]] <- aggregate(mu ~ producto, lost, sum)
     unmatched[[site$site]]$local <- site$site
@@ -190,7 +232,7 @@ for (site in CONFIG$sites) {
   matched$semana <- week_start(matched$fecha)
 
   # Weekly view: dishes that use each ingredient, with a normal confidence interval.
-  by_dish <- aggregate(cbind(mu_ing, var_ing) ~ semana + ingrediente + producto, matched, sum)
+  by_dish <- aggregate(cbind(mu, mu_ing, var_ing) ~ semana + ingrediente + producto, matched, sum)
   by_dish$local <- site$site
   weekly_dish[[site$site]] <- by_dish
   daily <- aggregate(cbind(mu_ing, var_ing) ~ fecha + ingrediente, matched, sum)
@@ -288,7 +330,7 @@ if (!is.null(semanal)) {
     local = semanal$local, semana_inicio = as.character(semanal$semana),
     semana_fin = as.character(semanal$semana + 6), dias_en_horizonte = semanal$dias_en_horizonte,
     ingrediente = semanal$ingrediente,
-    platos_esperados = round(semanal$mu_ing, 1), desviacion_estandar = round(semanal$sd, 2),
+    porciones_esperadas = round(semanal$mu_ing, 1), desviacion_estandar = round(semanal$sd, 2),
     nivel_confianza = CONFIG$confidence_level,
     ic_inferior = round(pmax(0, semanal$mu_ing - z_ci * semanal$sd), 1),
     ic_superior = round(semanal$mu_ing + z_ci * semanal$sd, 1),
@@ -300,20 +342,26 @@ if (!is.null(semanal)) {
     semanal$porciones_a_preparar <- prepared$pedido_sugerido[match(key, pkey)]
     semanal$porciones_a_preparar[is.na(semanal$porciones_a_preparar)] <- 0
   }
-  semanal <- semanal[order(semanal$local, semanal$semana_inicio, -semanal$platos_esperados), ]
+  semanal <- semanal[order(semanal$local, semanal$semana_inicio, -semanal$porciones_esperadas), ]
 } else {
   semanal <- data.frame(local = character(), semana_inicio = character(), ingrediente = character(),
-                        platos_esperados = numeric())
+                        porciones_esperadas = numeric())
 }
 detalle <- if (length(weekly_dish)) do.call(rbind, weekly_dish) else NULL
 detalle <- if (!is.null(detalle)) data.frame(
   local = detalle$local, semana_inicio = as.character(detalle$semana), ingrediente = detalle$ingrediente,
-  producto = detalle$producto, platos_esperados = round(detalle$mu_ing, 2),
+  producto = detalle$producto, platos_esperados = round(detalle$mu, 2),
+  porciones_esperadas = round(detalle$mu_ing, 2),
   desviacion_estandar = round(sqrt(detalle$var_ing), 2), stringsAsFactors = FALSE) else
-  data.frame(local = character(), semana_inicio = character(), ingrediente = character(), producto = character())
-detalle <- detalle[order(detalle$local, detalle$semana_inicio, detalle$ingrediente, -detalle$platos_esperados), ]
+  data.frame(local = character(), semana_inicio = character(), ingrediente = character(), producto = character(),
+             platos_esperados = numeric(), porciones_esperadas = numeric(), desviacion_estandar = numeric())
+detalle <- detalle[order(detalle$local, detalle$semana_inicio, detalle$ingrediente, -detalle$porciones_esperadas), ]
 sin_composicion <- if (length(unmatched)) {
   x <- do.call(rbind, unmatched)
+  data.frame(local = x$local, producto = x$producto, demanda_horizonte_excluida = round(x$mu, 1))
+} else data.frame(local = character(), producto = character(), demanda_horizonte_excluida = numeric())
+sin_ventas <- if (length(inactive)) {
+  x <- do.call(rbind, inactive)
   data.frame(local = x$local, producto = x$producto, demanda_horizonte_excluida = round(x$mu, 1))
 } else data.frame(local = character(), producto = character(), demanda_horizonte_excluida = numeric())
 sin_cobertura <- if (length(uncovered)) do.call(rbind, uncovered) else
@@ -333,15 +381,16 @@ parametros <- data.frame(
   stringsAsFactors = FALSE)
 
 diccionario <- data.frame(
-  columna = c("platos_esperados", "desviacion_estandar", "ic_inferior / ic_superior", "porciones_a_preparar",
+  columna = c("porciones_esperadas", "platos_esperados", "desviacion_estandar", "ic_inferior / ic_superior", "porciones_a_preparar",
               "fecha_entrega", "vida_util_dias", "stock_objetivo", "pedido_sugerido",
               "inventario_inicial_esperado", "restriccion_vida_util", "demanda_fuera_vida_util",
               "destino_sobrante", "costo_sobrante_Co", "costo_quiebre_Cu", "fractil_critico",
               "fill_rate_esperado", "merma_esperada", "transferencia_esperada"),
   definicion = c(
-    "Suma en la semana de demanda predicha x cantidad_por_plato de los platos que usan el ingrediente",
+    "Porciones del ingrediente: suma en la semana de demanda predicha x cantidad_por_plato de los platos que lo usan",
+    "Solo en Detalle_semanal_plato: platos pronosticados del producto en la semana (sin multiplicar por cantidad_por_plato)",
     "Raiz de la suma de varianzas diarias de esos platos (independencia entre dias y platos)",
-    "platos_esperados -/+ z * desviacion_estandar con el nivel de confianza elegido (inferior acotado en 0)",
+    "porciones_esperadas -/+ z * desviacion_estandar con el nivel de confianza elegido (inferior acotado en 0)",
     "Suma de pedido_sugerido de los despachos de esa semana",
     "Dia de despacho: la preparacion queda terminada y disponible en el local ese dia",
     "Dias utilizables contados desde el termino de la preparacion (= dia de despacho, dia 1)",
@@ -361,6 +410,7 @@ diccionario <- data.frame(
 
 tables <- list(Parametros = parametros, Resumen_semanal = semanal, Detalle_semanal_plato = detalle,
                Politica_ingrediente = politica, Productos_sin_composicion = sin_composicion,
+               Productos_sin_ventas_recientes = sin_ventas,
                Dias_sin_cobertura = sin_cobertura, Composicion_usada = parameters$comp[, c("local", "producto",
                "ingrediente", "cantidad_por_plato", "fuente")], Vida_util_usada = vida, Diccionario = diccionario)
 
@@ -385,6 +435,6 @@ jsonlite::write_json(c(CONFIG, list(generated_at = format(Sys.time(), tz = "UTC"
 cat("\n========== INVENTARIO: RESUMEN ==========\n")
 cat("Ingredientes:", length(unique(politica$ingrediente)), "| Ciclos:", nrow(politica),
     "| Productos sin composicion:", nrow(sin_composicion), "\n")
-if (nrow(semanal)) print(head(semanal[, c("local", "semana_inicio", "ingrediente", "platos_esperados",
+if (nrow(semanal)) print(head(semanal[, c("local", "semana_inicio", "ingrediente", "porciones_esperadas",
                                           "ic_inferior", "ic_superior")], 12), row.names = FALSE)
 cat("\nResultados:", CONFIG$output_directory, "\n")

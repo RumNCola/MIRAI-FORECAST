@@ -11,12 +11,14 @@ import altair as alt
 import polars as pl
 import streamlit as st
 
-from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_SETTINGS, MODEL_SETTINGS, REPOSITORY_ROOT,
+from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_SETTINGS, MODEL_SETTINGS, REPORT_OUTPUT_SUBDIRECTORY,
+                             REPORT_SITES, REPOSITORY_ROOT,
                              Defaults, code_defaults, load_user_defaults, reset_user_defaults, save_user_defaults,
                              user_defaults_path)
 from src.interface import (compare_parameters_workbooks, create_run, default_parameters_workbook, execute_run,
                            read_parameters_workbook, replace_default_parameters, result_zip,
                            validate_parameters_workbook, validate_uploads)
+from src.report import read_status
 from src.runtime import PipelineError, find_rscript
 
 
@@ -94,7 +96,7 @@ h2, h3 {letter-spacing: -.02em;}
 .mirai-section p {color: var(--ink-soft) !important; font-size: 1.1rem; margin: .7rem 0 0;}
 
 /* Site cards (one per local) ------------------------------------------------------------------ */
-div[class*="st-key-site-card-"] {
+div[class*="st-key-site-card-"], div.st-key-report-card {
   background: var(--mirai-blush); border: 1px solid #EBDADC !important; border-radius: 12px; padding: .4rem .6rem;
 }
 div[class*="st-key-site-card-"] h3 {
@@ -155,6 +157,18 @@ section[data-testid="stSidebar"] ol li::before {
   background: var(--mirai-blush) !important; border-left: 3px solid var(--mirai-coral); color: #7A1F21;
 }
 [data-testid="stAlertContentInfo"], [data-testid="stAlertContentInfo"] * {color: #7A1F21 !important;}
+
+/* Data-history warning (front page) -------------------------------------------------------- */
+.mirai-history {
+  display: flex; gap: 1.4rem; align-items: flex-start; margin: 1.6rem 0 .4rem; padding: 1.6rem 1.8rem;
+  background: #FEF3C7; border: 2px solid #E3A008; border-left-width: 10px; border-radius: 12px; color: #5B3A06;
+}
+.mirai-history .icon {flex: none; font-size: 3rem; line-height: 1;}
+.mirai-history h2 {font-size: clamp(1.4rem, 2.6vw, 2rem) !important; text-transform: uppercase; letter-spacing: -.02em;
+                   color: #5B3A06 !important; margin: 0 0 .6rem !important; padding: 0 !important; line-height: 1.15;}
+.mirai-history ul {margin: 0; padding-left: 1.1rem;}
+.mirai-history li {font-size: 1.05rem; margin-bottom: .3rem; color: #5B3A06;}
+.mirai-history [data-testid="stHeaderActionElements"] {display: none;}
 
 /* Footer -------------------------------------------------------------------------------------- */
 .mirai-footer {
@@ -237,18 +251,19 @@ def show_inventory(output: Path) -> None:
     site = a.selectbox("Local", weekly["local"].unique(maintain_order=True).to_list(), key="inventory-site")
     site_rows = weekly.filter(pl.col("local") == site)
     with b:
-        ingredients = ordered_options(site_rows, "ingrediente", "platos_esperados", "inventory-ingredient")
+        ingredients = ordered_options(site_rows, "ingrediente", "porciones_esperadas", "inventory-ingredient")
         ingredient = st.selectbox("Ingrediente o preparación", ingredients, key="inventory-ingredient",
-                                  help="Ordenados por platos esperados en el horizonte, salvo que actives el orden alfabético.")
+                                  help="Ordenados por porciones esperadas en el horizonte, salvo que actives el orden alfabético.")
     selected = site_rows.filter(pl.col("ingrediente") == ingredient).sort("semana_inicio")
     first = selected.row(0, named=True)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Platos esperados (1.ª semana)", f"{first['platos_esperados']:,.0f}")
+    c1.metric("Porciones esperadas (1.ª semana)", f"{first['porciones_esperadas']:,.0f}",
+              help="Porciones del ingrediente: platos pronosticados × cantidad_por_plato.")
     c2.metric(f"IC {confidence:.0%}", f"{first['ic_inferior']:,.0f} – {first['ic_superior']:,.0f}")
     c3.metric("Vida útil (días)", "Sin dato" if first["vida_util_dias"] is None else f"{first['vida_util_dias']:g}")
     st.caption(f"Platos que lo usan: {first['platos_que_lo_usan']}. La semana parcial muestra solo los días del "
                "horizonte. El intervalo supone errores normales e independientes entre días y platos.")
-    st.dataframe(selected.select("semana_inicio", "dias_en_horizonte", "platos_esperados", "desviacion_estandar",
+    st.dataframe(selected.select("semana_inicio", "dias_en_horizonte", "porciones_esperadas", "desviacion_estandar",
                                  "ic_inferior", "ic_superior", *(["porciones_a_preparar"]
                                  if "porciones_a_preparar" in selected.columns else [])),
                  hide_index=True, width="stretch")
@@ -262,12 +277,41 @@ def show_inventory(output: Path) -> None:
     with st.expander("Todos los ingredientes de la semana"):
         week = st.selectbox("Semana", site_rows["semana_inicio"].unique().sort().to_list(), key="inventory-week")
         st.dataframe(site_rows.filter(pl.col("semana_inicio") == week)
-                     .select("ingrediente", "platos_esperados", "ic_inferior", "ic_superior", "vida_util_dias",
+                     .select("ingrediente", "porciones_esperadas", "ic_inferior", "ic_superior", "vida_util_dias",
                              "platos_que_lo_usan"), hide_index=True, width="stretch")
     missing = output / "productos_sin_composicion.parquet"
     if missing.exists() and not (excluded := pl.read_parquet(missing)).is_empty():
         with st.expander(f"Productos sin composición ({excluded.height}): no entran al inventario"):
             st.dataframe(excluded.sort("demanda_horizonte_excluida", descending=True), hide_index=True, width="stretch")
+    stale = output / "productos_sin_ventas_recientes.parquet"
+    if stale.exists() and not (gone := pl.read_parquet(stale)).is_empty():
+        with st.expander(f"Productos sin ventas recientes ({gone.height}): no entran al inventario"):
+            st.caption("No se vendieron en los últimos días de datos (salieron de la carta o cambiaron de nombre), "
+                       "aunque el modelo todavía les asigne un pronóstico. El reporte de producción aplica la misma regla.")
+            st.dataframe(gone.sort("demanda_horizonte_excluida", descending=True), hide_index=True, width="stretch")
+
+
+def show_report(run: Path) -> None:
+    """Production report (PDF) for the central kitchen, or why it was not generated."""
+    directory = run / "out" / REPORT_OUTPUT_SUBDIRECTORY
+    status = read_status(directory)
+    if status is None:
+        return
+    pdf = directory / (status.get("archivo") or "")
+    if status.get("estado") == "generado" and pdf.is_file():
+        with st.container(border=True, key="report-card"):
+            st.subheader("Reporte de producción")
+            st.caption(f"{status['mensaje']} Cuánto producir por ciclo y cuánto despachar a cada local, "
+                       "para la cocina central.")
+            st.download_button("Descargar reporte de producción (PDF)", pdf.read_bytes(), file_name=pdf.name,
+                               mime="application/pdf", type="primary", key="download-report")
+    elif status.get("estado") == "generado":
+        st.warning("El reporte de producción se generó, pero el archivo ya no está en la carpeta de la ejecución. "
+                   "Vuelve a ejecutar el pronóstico para recuperarlo.")
+    elif status.get("estado") == "omitido":
+        st.info(status["mensaje"])
+    else:
+        st.warning(f"No se generó el reporte de producción. {status.get('mensaje', '')}")
 
 
 def show_results(run: Path, sites: list[str]) -> None:
@@ -276,6 +320,7 @@ def show_results(run: Path, sites: list[str]) -> None:
     st.caption(f"Ejecución: {run.name}. Los resultados corresponden a los parámetros guardados en esta ejecución.")
     st.download_button("Descargar todos los resultados (.zip)", result_zip(run),
                        file_name=f"mirai-{run.name}.zip", mime="application/zip", type="primary")
+    show_report(run)
     inventory_output = run / "out" / INVENTORY_SETTINGS.output_subdirectory
     has_inventory = inventory_output.exists()
     tabs = st.tabs([*sites, "INVENTARIO"] if has_inventory else sites)
@@ -503,6 +548,24 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+MINIMUM_WEEKS = next(iter(DEFAULTS.model_settings.values())).residual_min_observations
+st.markdown(f"""
+<div class="mirai-history" role="alert">
+  <div class="icon">⚠️</div>
+  <div>
+    <h2>Tener ventas de al menos un año atrás enriquece enormemente el pronóstico</h2>
+    <ul>
+      <li>Carga <b>todos los meses que tengas de cada local, desde hace al menos un año</b>: así el modelo
+          aprende cómo cambia la demanda de un mes a otro y entre temporadas. Puedes subir varios Excel a la vez.</li>
+      <li>Con poca historia el modelo no alcanza a aprender los patrones por día de la semana y por mes,
+          y usa un modelo más simple y menos preciso.</li>
+      <li>Para medir la variabilidad de cada día de la semana se necesitan al menos {MINIMUM_WEEKS} semanas
+          de ventas; con menos, el margen del reporte de producción es menos exacto.</li>
+    </ul>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
 section(1, "Carga tus ventas", anchor="carga")
 sites = st.multiselect("¿Qué locales quieres analizar?", ["MUT", "FRANKLIN"], default=["MUT"],
                        help="Puedes ejecutar un solo local o ambos. Cada local tendrá su propio informe.")
@@ -602,6 +665,10 @@ with st.expander("Opciones avanzadas"):
     minimum = st.number_input("Mínimo de observaciones para variabilidad por día", min_value=2, max_value=100,
                               value=base_settings.residual_min_observations)
     st.caption("Siempre se genera Excel. Los períodos superpuestos se rechazan para evitar contar ventas dos veces.")
+    report_start_today = st.checkbox(
+        "Reporte de producción: comenzar hoy", value=False, key="report-start-today",
+        help="Por defecto el reporte cubre la próxima semana de producción, de viernes a jueves. "
+             "Actívalo para que cubra desde hoy y los 6 días siguientes.")
 settings = {site: replace(value, generate_plots=plots, export_parquet=parquet,
                           history_plot_days=int(history), residual_min_observations=int(minimum))
             for site, value in settings.items()}
@@ -614,6 +681,8 @@ st.write("")
 if not ready:
     st.caption("Para continuar, selecciona al menos un local, carga sus Excel y elige sus días de apertura y de despacho.")
 st.caption("Se usarán solo los archivos de esta carga. Las ejecuciones anteriores se conservan por separado.")
+if sites and set(REPORT_SITES) - set(sites):
+    st.caption("El reporte de producción para la cocina central se genera cuando analizas MUT y FRANKLIN juntos.")
 if st.button("Generar pronóstico", type="primary", disabled=not ready or not runtime_ready, width="stretch", key="generate"):
     st.session_state.pop("completed_run", None)
     st.session_state.pop("failed_run", None)
@@ -624,7 +693,8 @@ if st.button("Generar pronóstico", type="primary", disabled=not ready or not ru
             run = create_run(REPOSITORY_ROOT, uploads, settings, parameters if inventory_enabled else None)
             st.write("Archivos guardados. Validando datos y ejecutando los modelos…")
             execute_run(REPOSITORY_ROOT, run, settings, LiveLog(st.empty()),
-                        inventory=inventory_settings, inventory_sites=inventory_sites)
+                        inventory=inventory_settings, inventory_sites=inventory_sites,
+                        report_start_today=report_start_today)
         except Exception as exc:
             status.update(label="No se pudo completar el análisis", state="error")
             st.error(str(exc))
@@ -636,6 +706,7 @@ if st.button("Generar pronóstico", type="primary", disabled=not ready or not ru
             st.session_state.completed_run = (str(run), list(settings))
 
 if "failed_run" in st.session_state:
+    show_report(Path(st.session_state.failed_run))   # the PDF may exist even if a later step failed
     log = Path(st.session_state.failed_run) / "pipeline.log"
     if log.exists():
         with st.expander("Detalle de la ejecución fallida"):

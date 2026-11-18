@@ -202,3 +202,17 @@ write_analysis_outputs <- function(tables, context) {
                        auto_unbox = TRUE, pretty = TRUE, null = "null")
   invisible(workbook)
 }
+
+# Draw a line only between consecutive calendar days: a day without data or forecast in between
+# (e.g. Franklin's Monday-Thursday) breaks the line instead of joining Sunday to Friday.
+lines_by_day <- function(x, y, ...) {
+  order_x <- order(x)
+  x <- x[order_x]
+  y <- y[order_x]
+  segment <- cumsum(c(TRUE, diff(as.numeric(x)) > 1))
+  for (part in unique(segment)) {
+    keep <- segment == part
+    if (sum(keep) > 1) lines(x[keep], y[keep], ...) else points(x[keep], y[keep], pch = 16, cex = 0.6, ...)
+  }
+  invisible(NULL)
+}

@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from settings.config import MODEL_SETTINGS
+from settings.config import INVENTORY_SETTINGS, MODEL_SETTINGS
 from src.interface import create_run, result_zip, validate_uploads
 from main import run_pipeline
 
@@ -63,7 +63,8 @@ class InterfaceTests(unittest.TestCase):
                  patch("main.r_environment", return_value={"R_LIBS_USER": "library"}), \
                  patch("main.run_logged") as child, patch("src.elt.ELT") as elt:
                 elt.return_value.run.return_value = Mock(processed=1, skipped=0, failed=0)
-                run_pipeline(root, logging.getLogger("test"), model_settings=settings, data_root=run, strict_inputs=True)
+                run_pipeline(root, logging.getLogger("test"), model_settings=settings, data_root=run, strict_inputs=True,
+                             inventory_settings=replace(INVENTORY_SETTINGS, enabled=False))
                 self.assertEqual(child.call_count, 2)
                 elt.assert_called_once_with(run, logger=logging.getLogger("test"))
                 config_path = Path(child.call_args.kwargs["env"]["MIRAI_MODEL_CONFIG"])
@@ -83,5 +84,6 @@ class InterfaceTests(unittest.TestCase):
                  patch("main.run_logged") as child, patch("src.elt.ELT") as elt:
                 elt.return_value.run.return_value = Mock(processed=0, skipped=0, failed=1)
                 with self.assertRaisesRegex(RuntimeError, "rechazados"):
-                    run_pipeline(root, Mock(), model_settings={"MUT": MODEL_SETTINGS["MUT"]}, strict_inputs=True)
+                    run_pipeline(root, Mock(), model_settings={"MUT": MODEL_SETTINGS["MUT"]}, strict_inputs=True,
+                                 inventory_settings=replace(INVENTORY_SETTINGS, enabled=False))
                 self.assertEqual(child.call_count, 1)

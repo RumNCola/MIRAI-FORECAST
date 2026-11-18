@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from settings.config import CRAN_MIRROR, MIN_PYTHON, MODEL_SCRIPTS, R_VERSION, get_model_config
+from settings.config import CRAN_MIRROR, MIN_PYTHON, MODEL_SCRIPTS, R_VERSION, get_inventory_config, get_model_config
 from src.runtime import PipelineError, find_rscript, pipeline_lock, pipeline_logger, r_environment, run_logged
 
 
@@ -104,7 +104,8 @@ def prepare_environment(root: Path, logger: logging.Logger) -> None:
         rscript = install_r(root, logger)
     logger.info("R runtime selected: %s", rscript)
     environment = r_environment(root, rscript)
-    packages = sorted({package for config in configurations for package in config["required_r_packages"]})
+    packages = sorted({package for config in configurations for package in config["required_r_packages"]}
+                      | set(get_inventory_config(repository_root=root)["required_r_packages"]))
     run_logged([str(rscript), "--vanilla", str(root / "scripts" / "prepare_r.R"),
                 "install", environment["R_LIBS_USER"], CRAN_MIRROR, *packages],
                label="R dependency preparation", root=root, logger=logger, env=environment)

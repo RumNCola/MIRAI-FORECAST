@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import main as application
-from settings.config import MODEL_SCRIPTS
+from settings.config import INVENTORY_PARAMETERS_WORKBOOK, INVENTORY_SCRIPT, MODEL_SCRIPTS
 from src.runtime import PipelineError, find_rscript, run_logged
 
 
@@ -21,7 +21,7 @@ class PipelineTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for relative in MODEL_SCRIPTS.values():
+        for relative in (*MODEL_SCRIPTS.values(), INVENTORY_SCRIPT, INVENTORY_PARAMETERS_WORKBOOK):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# fixture", encoding="utf-8")
@@ -43,14 +43,15 @@ class PipelineTests(unittest.TestCase):
             return Mock(processed=0, skipped=3, failed=0)
         self.elt.return_value.run.side_effect = elt_result
         self.assertEqual(application.main(self.root), 0)
-        self.assertEqual(order, ["R dependency check", "ELT", "FRANKLIN demand model", "MUT demand model"])
+        self.assertEqual(order, ["R dependency check", "ELT", "FRANKLIN demand model", "MUT demand model",
+                                 "Inventory model"])
         self.assertIn("Analysis pipeline completed successfully", self.events())
         self.assertFalse((self.root / ".pipeline.lock").exists())
 
     def test_recoverable_elt_rejections_allow_both_models(self):
         self.elt.return_value.run.return_value = Mock(processed=1, skipped=0, failed=1)
         self.assertEqual(application.main(self.root), 0)
-        self.assertEqual(self.child.call_count, 3)
+        self.assertEqual(self.child.call_count, 4)
         self.assertIn("WARNING", self.events())
         self.assertNotIn("ERROR", self.events())
 
@@ -75,6 +76,37 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(application.main(self.root), 1)
         self.elt.assert_not_called()
         self.assertIn("Run main.bat", self.events())
+
+    def test_inventory_runs_last_with_its_own_configuration(self):
+        self.assertEqual(application.main(self.root), 0)
+        inventory_call = self.child.call_args_list[-1]
+        self.assertEqual(inventory_call.kwargs["label"], "Inventory model")
+        environment = inventory_call.kwargs["env"]
+        self.assertNotIn("MIRAI_MODEL_CONFIG", environment)
+        config = __import__("json").loads(Path(environment["MIRAI_INVENTORY_CONFIG"]).read_text(encoding="utf-8"))
+        self.assertEqual([site["site"] for site in config["sites"]], ["FRANKLIN", "MUT"])
+        self.assertEqual(config["sites"][1]["delivery_weekdays"], [2, 5])
+        self.assertIn("Inventory analysis saved", self.events())
+
+    def test_saved_defaults_drive_console_runs(self):
+        defaults = self.root / "settings" / "valores_por_defecto.json"
+        defaults.write_text('{"schema_version": 1, "general": {"horizon_days": 14}, '
+                            '"sites": {"MUT": {"delivery_weekdays": [3]}}}', encoding="utf-8")
+        self.assertEqual(application.main(self.root), 0)
+        environment = self.child.call_args_list[-1].kwargs["env"]
+        config = __import__("json").loads(Path(environment["MIRAI_INVENTORY_CONFIG"]).read_text(encoding="utf-8"))
+        self.assertEqual(config["sites"][1]["delivery_weekdays"], [3])
+        self.assertEqual(config["sites"][1]["horizon_days"], 14)
+        self.assertIn("Using saved defaults", self.events())
+        defaults.write_text("{broken", encoding="utf-8")
+        self.assertEqual(application.main(self.root), 1)
+        self.assertIn("valores_por_defecto.json is invalid", self.events())
+
+    def test_missing_parameters_workbook_fails_before_any_child_process(self):
+        (self.root / INVENTORY_PARAMETERS_WORKBOOK).unlink()
+        self.assertEqual(application.main(self.root), 1)
+        self.child.assert_not_called()
+        self.assertIn("inventory parameters workbook", self.events())
 
     def test_existing_pipeline_lock_is_not_deleted(self):
         path = self.root / ".pipeline.lock"

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import polars as pl
 
-from settings.config import MODEL_SETTINGS, get_model_config
+from settings.config import MODEL_SETTINGS, get_model_config, load_user_defaults
 from src.elt import ELT
 from src.runtime import find_rscript, r_environment
 
@@ -74,7 +74,8 @@ class ModelConfigTests(unittest.TestCase):
         config = json.loads(completed.stdout)
         self.assertEqual(config["site"], "MUT")
         self.assertEqual(config["repository_root"], REPOSITORY.as_posix())
-        self.assertEqual(config["horizon_days"], 28)
+        # The CLI starts from the defaults saved in the interface, if any.
+        self.assertEqual(config["horizon_days"], load_user_defaults().model_settings["MUT"].horizon_days)
 
     def test_import_does_not_start_the_pipeline_or_create_outputs(self):
         with tempfile.TemporaryDirectory() as directory:

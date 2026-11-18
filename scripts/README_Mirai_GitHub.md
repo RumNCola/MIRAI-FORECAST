@@ -1,6 +1,6 @@
 # Mirai | Pronóstico de demanda por producto
 
-Scripts en **R** para estimar la demanda diaria de cada producto de **Franklin** y **MUT**. Los pronósticos y la variabilidad de sus errores se exportan a Excel para utilizarlos posteriormente en un modelo de planificación de producción e inventarios.
+Scripts en **R** para estimar la demanda diaria de cada producto de **Franklin** y **MUT**. Los pronósticos y la variabilidad de sus errores se exportan a Excel y los usa `modelo_inventario.R` para planificar preparaciones por ingrediente.
 
 ## 1. Archivos y ejecución
 

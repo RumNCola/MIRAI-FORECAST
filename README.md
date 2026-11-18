@@ -16,11 +16,41 @@ la usas; para cerrarla presiona Ctrl+C en esa consola.
 2. Elige los días calendario del horizonte, los días de apertura y el patrón de
    ventas de cada local. Los valores iniciales corresponden al modelo existente.
    El horizonte empieza después de la última venta del local, no de la fecha actual.
+   Para el inventario elige además, por local, los **días de despacho de pedidos**
+   (días en que se despacha y en que lo despachado queda disponible en el local),
+   el costo de quiebre y si los sobrantes vigentes se envían a otro local. En **Inventario por
+   ingrediente** se fijan el nivel de confianza del intervalo semanal y el nivel de
+   servicio de ingredientes sin vida útil conocida. Ahí también se descarga y se
+   puede volver a subir, editado, el Excel de parámetros (hojas `vida_util` y
+   `composicion`).
 3. Pulsa **Generar pronóstico**. Se validan todos los archivos; si alguno es
    rechazado, corrígelo antes de ejecutar nuevamente. Los registros permiten
    identificar el problema sin editar código.
 4. Revisa el pronóstico por producto y descarga el Excel de cada local o el ZIP
-   con todos los informes y gráficos. La vista previa requiere la opción Parquet.
+   con todos los informes y gráficos. La pestaña **INVENTARIO** muestra, por
+   ingrediente y semana, los platos esperados que lo usan con su intervalo de
+   confianza, y las preparaciones sugeridas por despacho. La vista previa requiere
+   la opción Parquet.
+
+### Valores por defecto
+
+En la barra lateral, **Vista → Valores por defecto** permite cambiar los valores
+con que parte la pantalla de pronóstico (horizonte, días de apertura, patrón de
+ventas, días de despacho y disponibilidad, costo de quiebre,
+transferencia de sobrantes, opciones de gráficos y del inventario). Se guardan en
+`settings/valores_por_defecto.json`; `main.bat` y los scripts R ejecutados por
+separado también los usan. **Restaurar valores originales** borra ese archivo y
+vuelve a los valores de `settings/config.py`.
+
+En la misma vista se reemplaza el Excel base `settings/inventario_parametros.xlsx`.
+Al subir uno nuevo se valida su formato: hojas `vida_util` y `composicion` con sus
+columnas, ingredientes sin repetir, vida útil positiva o vacía, locales FRANKLIN,
+MUT o AMBOS, ingredientes de `composicion` presentes en `vida_util`, cantidades
+positivas y sin platos con el mismo ingrediente dos veces. Si no cumple, se
+rechaza y el base no cambia. Si cumple, se muestran por hoja las filas añadidas y
+eliminadas (una fila editada cuenta como una eliminada y una añadida) y se
+reemplaza al confirmar. La versión anterior queda respaldada en
+`out/parametros_respaldo/`.
 
 Cada carga usa únicamente sus propios archivos y se guarda por separado en
 `out/ejecuciones/<identificador>/`: originales, datos procesados, registros,
@@ -102,8 +132,27 @@ analysis tables, Excel reports, plots and configuration snapshots in
 `out/franklin/` and `out/mut/`. R requires `arrow`, `digest`, `jsonlite`, `tzdb` and
 `writexl`. See [the model documentation](scripts/README_Mirai_GitHub.md).
 
+## Inventory model
+
+`scripts/modelo_inventario.R` runs after the demand models. It reads the `Pronosticos`
+sheet of each demand workbook from the same run, the dish composition and the shelf
+life of each ingredient in `settings/inventario_parametros.xlsx` (sheets `composicion`
+and `vida_util`, editable as tables), and the replenishment calendar in
+`settings/config.py` (`InventorySiteSettings`: dispatch and availability weekdays, shortage cost, leftover
+transfer; `InventorySettings`:
+confidence level and default service level). Preparations are finished on the dispatch
+day and shelf life is counted from that finish date, never from the start. Results go to `out/inventario/`
+(`modelo_inventario.xlsx` and Parquet tables): weekly expected dishes per ingredient with
+a confidence interval, and a perishable newsvendor policy per dispatch. R additionally
+requires `readxl`. Assumptions and sources:
+[SUPUESTOS_modelo_inventario.md](scripts/SUPUESTOS_modelo_inventario.md).
+
+```powershell
+Rscript scripts/modelo_inventario.R   # after both demand models; uses default settings
+```
+
 The implemented execution order is `main.bat` → environment setup → `main.py`
-→ ELT → Franklin → MUT. If either model fails, subsequent stages stop and the
+→ ELT → Franklin → MUT → inventory. If any model fails, subsequent stages stop and the
 pipeline does not record a successful completion.
 
 

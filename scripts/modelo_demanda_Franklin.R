@@ -191,7 +191,7 @@ for (i in seq_along(productos)) {
        ylim = range(c(0, df$demanda, estimado)),
        xlab = "Fecha", ylab = "Unidades",
        main = "Historico: real vs ajustado")
-  lines(df$fecha, estimado, col = "steelblue", lwd = 2)
+  lines_by_day(df$fecha, estimado, col = "steelblue", lwd = 2)
   legend("topleft", c("Real", "Ajustado"),
          col = c("grey60", "steelblue"),
          pch = c(16, NA), lty = c(0, 1),
@@ -236,9 +236,9 @@ for (i in seq_along(productos)) {
        main = paste("Ultimos", CONFIG$history_plot_days, "dias y pronostico"))
   points(df$fecha[ult], df$demanda[ult],
          pch = 16, cex = 0.5, col = "grey60")
-  lines(df$fecha[ult], estimado[ult],
+  lines_by_day(df$fecha[ult], estimado[ult],
         col = "steelblue", lwd = 2)
-  lines(futuro$fecha, proyectado,
+  lines_by_day(futuro$fecha, proyectado,
         col = "firebrick", lwd = 2, lty = 2)
   legend("topleft", c("Real", "Ajustado", "Pronostico"),
          col = c("grey60", "steelblue", "firebrick"),

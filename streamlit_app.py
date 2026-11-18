@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from pathlib import Path
 
+import altair as alt
 import polars as pl
 import streamlit as st
 
-from settings.config import MODEL_SETTINGS, REPOSITORY_ROOT
-from src.interface import create_run, execute_run, result_zip, validate_uploads
+from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_SETTINGS, MODEL_SETTINGS, REPOSITORY_ROOT,
+                             Defaults, code_defaults, load_user_defaults, reset_user_defaults, save_user_defaults,
+                             user_defaults_path)
+from src.interface import (compare_parameters_workbooks, create_run, default_parameters_workbook, execute_run,
+                           read_parameters_workbook, replace_default_parameters, result_zip,
+                           validate_parameters_workbook, validate_uploads)
 from src.runtime import PipelineError, find_rscript
 
 
@@ -160,6 +166,9 @@ section[data-testid="stSidebar"] ol li::before {
 
 WEEKDAYS = {1: "Lunes", 2: "Martes", 3: "Miércoles", 4: "Jueves", 5: "Viernes", 6: "Sábado", 7: "Domingo"}
 MODELS = {"dia": "Por día de la semana", "dia_mes_anual": "Por día de la semana y mes"}
+DISPATCH_HELP = ("Días en que se despacha un pedido al local y en que lo despachado queda disponible ahí. Cada despacho "
+                 "cubre los días de apertura hasta el siguiente. Las preparaciones quedan terminadas el día de despacho "
+                 "y su vida útil se cuenta desde ese término, no desde su inicio.")
 
 
 def section(number: int, title: str, subtitle: str | None = None, anchor: str | None = None) -> None:
@@ -181,13 +190,99 @@ class LiveLog(logging.Handler):
         self.placeholder.code("\n".join(self.lines[-18:]), language=None)
 
 
+def ordered_options(frame: pl.DataFrame, name: str, quantity: str, key: str) -> list[str]:
+    """Options sorted by total quantity (largest first) or, with the toggle on, alphabetically."""
+    alphabetical = st.toggle("Orden alfabético", key=f"alphabetical-{key}",
+                             help="Por defecto la lista se ordena de mayor a menor cantidad proyectada.")
+    totals = frame.group_by(name).agg(pl.col(quantity).sum())
+    totals = (totals.sort(pl.col(name).str.to_lowercase()) if alphabetical
+              else totals.sort([quantity, name], descending=[True, False]))
+    return totals[name].to_list()
+
+
+def forecast_chart(selected: pl.DataFrame) -> alt.Chart:
+    """Daily forecast whose line breaks wherever a calendar day has no forecast (e.g. closed days)."""
+    date = pl.col("fecha").str.to_date() if selected.schema["fecha"] == pl.String else pl.col("fecha").cast(pl.Date)
+    data = (selected.select(date, "demanda_predicha").sort("fecha")
+            .with_columns((pl.col("fecha").diff().dt.total_days().fill_null(1) > 1).cum_sum().alias("tramo")))
+    base = alt.Chart(data.to_pandas()).encode(
+        x=alt.X("fecha:T", title="Fecha"), y=alt.Y("demanda_predicha:Q", title="Demanda predicha"),
+        tooltip=[alt.Tooltip("fecha:T", title="Fecha", format="%a %d-%m-%Y"),
+                 alt.Tooltip("demanda_predicha:Q", title="Demanda predicha", format=",.1f")])
+    return base.mark_line(color="#D1383A").encode(detail="tramo:N") + base.mark_point(color="#D1383A", filled=True)
+
+
+def order_graphs(graphs: list[Path], products: list[str]) -> list[Path]:
+    """Follow the product list order; R names each file NN_<product with non [A-Za-z0-9_-] as _>.png."""
+    position = {re.sub(r"[^A-Za-z0-9_-]", "_", product)[:65]: index for index, product in enumerate(products)}
+    return sorted(graphs, key=lambda path: (position.get(path.stem.split("_", 1)[-1], len(position)), path.name))
+
+
+def show_inventory(output: Path) -> None:
+    workbook = output / "modelo_inventario.xlsx"
+    if workbook.exists():
+        st.download_button("Descargar Excel de inventario", workbook.read_bytes(), file_name=workbook.name,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="download-inventory")
+    weekly_path, policy_path = output / "resumen_semanal.parquet", output / "politica_ingrediente.parquet"
+    if not weekly_path.exists():
+        st.info("Descarga el Excel para consultar el inventario por ingrediente.")
+        return
+    weekly = pl.read_parquet(weekly_path)
+    if weekly.is_empty():
+        st.warning("Ningún producto pronosticado calza con la hoja «composicion» del Excel de parámetros.")
+        return
+    confidence = float(weekly["nivel_confianza"][0])
+    a, b = st.columns(2)
+    site = a.selectbox("Local", weekly["local"].unique(maintain_order=True).to_list(), key="inventory-site")
+    site_rows = weekly.filter(pl.col("local") == site)
+    with b:
+        ingredients = ordered_options(site_rows, "ingrediente", "platos_esperados", "inventory-ingredient")
+        ingredient = st.selectbox("Ingrediente o preparación", ingredients, key="inventory-ingredient",
+                                  help="Ordenados por platos esperados en el horizonte, salvo que actives el orden alfabético.")
+    selected = site_rows.filter(pl.col("ingrediente") == ingredient).sort("semana_inicio")
+    first = selected.row(0, named=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Platos esperados (1.ª semana)", f"{first['platos_esperados']:,.0f}")
+    c2.metric(f"IC {confidence:.0%}", f"{first['ic_inferior']:,.0f} – {first['ic_superior']:,.0f}")
+    c3.metric("Vida útil (días)", "Sin dato" if first["vida_util_dias"] is None else f"{first['vida_util_dias']:g}")
+    st.caption(f"Platos que lo usan: {first['platos_que_lo_usan']}. La semana parcial muestra solo los días del "
+               "horizonte. El intervalo supone errores normales e independientes entre días y platos.")
+    st.dataframe(selected.select("semana_inicio", "dias_en_horizonte", "platos_esperados", "desviacion_estandar",
+                                 "ic_inferior", "ic_superior", *(["porciones_a_preparar"]
+                                 if "porciones_a_preparar" in selected.columns else [])),
+                 hide_index=True, width="stretch")
+    if policy_path.exists():
+        policy = pl.read_parquet(policy_path).filter((pl.col("local") == site) & (pl.col("ingrediente") == ingredient))
+        with st.expander("Preparaciones sugeridas por entrega"):
+            st.dataframe(policy.select("fecha_entrega", "dia_entrega", "dias_cubiertos",
+                                       "demanda_esperada_ciclo", "stock_objetivo", "pedido_sugerido",
+                                       "destino_sobrante", "restriccion_vida_util", "fill_rate_esperado"),
+                         hide_index=True, width="stretch")
+    with st.expander("Todos los ingredientes de la semana"):
+        week = st.selectbox("Semana", site_rows["semana_inicio"].unique().sort().to_list(), key="inventory-week")
+        st.dataframe(site_rows.filter(pl.col("semana_inicio") == week)
+                     .select("ingrediente", "platos_esperados", "ic_inferior", "ic_superior", "vida_util_dias",
+                             "platos_que_lo_usan"), hide_index=True, width="stretch")
+    missing = output / "productos_sin_composicion.parquet"
+    if missing.exists() and not (excluded := pl.read_parquet(missing)).is_empty():
+        with st.expander(f"Productos sin composición ({excluded.height}): no entran al inventario"):
+            st.dataframe(excluded.sort("demanda_horizonte_excluida", descending=True), hide_index=True, width="stretch")
+
+
 def show_results(run: Path, sites: list[str]) -> None:
     section(3, "Tus resultados")
     st.success("El pronóstico está listo. Puedes revisar las tablas y descargar los informes.")
     st.caption(f"Ejecución: {run.name}. Los resultados corresponden a los parámetros guardados en esta ejecución.")
     st.download_button("Descargar todos los resultados (.zip)", result_zip(run),
                        file_name=f"mirai-{run.name}.zip", mime="application/zip", type="primary")
-    for tab, site in zip(st.tabs(sites), sites):
+    inventory_output = run / "out" / INVENTORY_SETTINGS.output_subdirectory
+    has_inventory = inventory_output.exists()
+    tabs = st.tabs([*sites, "INVENTARIO"] if has_inventory else sites)
+    if has_inventory:
+        with tabs[-1]:
+            show_inventory(inventory_output)
+    for tab, site in zip(tabs, sites):
         with tab:
             output = run / "out" / MODEL_SETTINGS[site].output_subdirectory
             snapshot = json.loads((output / "config_used.json").read_text(encoding="utf-8"))
@@ -197,21 +292,22 @@ def show_results(run: Path, sites: list[str]) -> None:
                 st.download_button(f"Descargar Excel de {site}", workbook.read_bytes(), file_name=workbook.name,
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"download-{site}")
             forecast = output / "pronosticos.parquet"
+            products = []
             if forecast.exists():
                 frame = pl.read_parquet(forecast)
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Productos", frame["producto"].n_unique())
                 c2.metric("Fechas proyectadas", frame["fecha"].n_unique())
                 c3.metric("Unidades proyectadas", f"{frame['demanda_predicha'].sum():,.0f}")
-                products = sorted(frame["producto"].unique().to_list())
-                product = st.selectbox("Ver producto", products, key=f"product-{site}")
+                products = ordered_options(frame, "producto", "demanda_predicha", f"product-{site}")
+                product = st.selectbox("Ver producto", products, key=f"product-{site}",
+                                       help="Ordenados por unidades proyectadas, salvo que actives el orden alfabético.")
                 selected = frame.filter(pl.col("producto") == product).sort("fecha")
-                st.line_chart(selected.select("fecha", "demanda_predicha").to_pandas(), x="fecha", y="demanda_predicha",
-                              color="#D1383A")
+                st.altair_chart(forecast_chart(selected), width="stretch")
                 st.dataframe(selected, hide_index=True, width="stretch")
             else:
                 st.info("Descarga el Excel para consultar los pronósticos.")
-            graphs = sorted((output / "graphs").glob("*.png"))
+            graphs = order_graphs(sorted((output / "graphs").glob("*.png")), products)
             if graphs:
                 with st.expander("Explorar gráficos de diagnóstico"):
                     graph = st.selectbox("Gráfico", graphs, format_func=lambda p: p.stem, key=f"graph-{site}")
@@ -223,7 +319,7 @@ def show_results(run: Path, sites: list[str]) -> None:
 with st.sidebar:
     st.title("MIRAI")
     st.caption("Del Excel a tu próxima semana")
-    st.markdown("**Cómo funciona**\n\n1. Carga las ventas de cada local.\n2. Define cuántos días proyectar.\n3. Ejecuta y descarga el informe.")
+    st.markdown("**Cómo funciona**\n\n1. Carga las ventas de cada local.\n2. Define cuántos días proyectar y cuándo se despacha.\n3. Ejecuta y descarga el informe.")
     st.divider()
     try:
         runtime_ready = find_rscript(REPOSITORY_ROOT) is not None
@@ -237,6 +333,164 @@ with st.sidebar:
         st.warning(str(exc))
     st.caption("Abre iniciar_interfaz.bat para preparar el entorno y abrir esta pantalla.")
     st.caption("Los archivos y resultados se guardan en este equipo y están excluidos de Git.")
+    st.divider()
+    view = st.radio("Vista", ["Pronóstico", "Valores por defecto"], key="view",
+                    help="En «Valores por defecto» se cambian los valores iniciales de esta pantalla y el Excel base "
+                         "de composición de platos y vida útil.")
+
+try:
+    DEFAULTS = load_user_defaults(REPOSITORY_ROOT)
+    DEFAULTS_ERROR = None
+except ValueError as exc:
+    DEFAULTS, DEFAULTS_ERROR = code_defaults(), str(exc)
+
+FORECAST_WIDGET_PREFIXES = ("days-", "model-", "delivery-", "shortage-", "transfer-")
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def forget_forecast_widgets() -> None:
+    """Let the forecast view start again from the new defaults."""
+    for key in list(st.session_state):
+        if isinstance(key, str) and key.startswith(FORECAST_WIDGET_PREFIXES):
+            del st.session_state[key]
+
+
+def show_defaults_view() -> None:
+    st.markdown("""
+<div class="mirai-hero">
+  <div class="mirai-kicker">Mirai Food Lab / Configuración</div>
+  <h1>Valores por defecto</h1>
+  <p>Define con qué valores parte cada análisis y actualiza el Excel base de composición de platos y vida útil.</p>
+</div>""", unsafe_allow_html=True)
+    if DEFAULTS_ERROR:
+        st.error(f"Los valores guardados no son válidos y se usan los del código: {DEFAULTS_ERROR}")
+    section(1, "Parámetros iniciales", "Se usan al abrir la pantalla de pronóstico y al ejecutar main.bat.")
+    current = DEFAULTS
+    first = next(iter(current.model_settings.values()))
+    with st.form("defaults-form"):
+        st.subheader("Pronóstico")
+        a, b = st.columns(2)
+        horizon = a.number_input("Días calendario a proyectar", min_value=1, max_value=365, value=first.horizon_days,
+                                 key="def-horizon")
+        history = b.number_input("Días históricos visibles en los gráficos", min_value=1, max_value=730,
+                                 value=first.history_plot_days, key="def-history")
+        c, d, e = st.columns(3)
+        minimum = c.number_input("Mínimo de observaciones para variabilidad por día", min_value=2, max_value=100,
+                                 value=first.residual_min_observations, key="def-minimum")
+        plots = d.checkbox("Generar gráficos por producto", value=first.generate_plots, key="def-plots")
+        parquet = e.checkbox("Incluir tablas Parquet", value=first.export_parquet, key="def-parquet")
+        model_settings, inventory_sites = {}, {}
+        for site in MODEL_SETTINGS:
+            model, stock = current.model_settings[site], current.inventory_sites[site]
+            st.subheader(site)
+            f, g = st.columns(2)
+            opening = f.multiselect("Días de apertura", list(WEEKDAYS), default=list(model.operating_weekdays),
+                                    format_func=WEEKDAYS.get, key=f"def-days-{site}")
+            pattern = g.selectbox("Patrón de ventas", list(MODELS), index=list(MODELS).index(model.model),
+                                  format_func=MODELS.get, key=f"def-model-{site}")
+            h, j = st.columns(2)
+            deliveries = h.multiselect("Días de despacho de pedidos", list(WEEKDAYS), default=list(stock.delivery_weekdays),
+                                       format_func=WEEKDAYS.get, key=f"def-delivery-{site}", help=DISPATCH_HELP)
+            shortage = j.number_input("Costo de quiebre (veces el costo de una porción)", min_value=0.1, max_value=100.0,
+                                      value=float(stock.shortage_cost), step=0.5, key=f"def-shortage-{site}")
+            transfer = st.checkbox("Enviar sobrantes vigentes a otro local al día siguiente", value=stock.transfer_leftovers,
+                                   key=f"def-transfer-{site}")
+            model_settings[site] = replace(model, horizon_days=int(horizon), history_plot_days=int(history),
+                                           residual_min_observations=int(minimum), generate_plots=plots,
+                                           export_parquet=parquet, operating_weekdays=tuple(opening), model=pattern)
+            inventory_sites[site] = replace(stock, delivery_weekdays=tuple(deliveries), shortage_cost=float(shortage),
+                                            transfer_leftovers=transfer)
+        st.subheader("Inventario por ingrediente")
+        k, m, n = st.columns(3)
+        enabled = k.checkbox("Calcular inventario por ingrediente", value=current.inventory.enabled, key="def-inventory")
+        confidence = m.slider("Nivel de confianza del intervalo semanal", min_value=0.80, max_value=0.99,
+                              value=float(current.inventory.confidence_level), step=0.01, format="%.2f",
+                              key="def-confidence")
+        service = n.slider("Nivel de servicio sin vida útil conocida", min_value=0.50, max_value=0.99,
+                           value=float(current.inventory.default_service_level), step=0.01, format="%.2f",
+                           key="def-service")
+        submitted = st.form_submit_button("Guardar valores por defecto", type="primary")
+    if submitted:
+        candidate = Defaults(model_settings, inventory_sites,
+                             replace(current.inventory, enabled=enabled, confidence_level=float(confidence),
+                                     default_service_level=float(service)))
+        try:
+            path = save_user_defaults(candidate, REPOSITORY_ROOT)
+        except ValueError as exc:
+            st.error(f"No se guardaron los cambios: {exc}. Revisa que cada local tenga días de apertura y de despacho.")
+        else:
+            forget_forecast_widgets()
+            st.session_state["defaults_message"] = f"Valores guardados en {path.relative_to(REPOSITORY_ROOT).as_posix()}."
+            st.rerun()
+    if message := st.session_state.pop("defaults_message", None):
+        st.success(message)
+    saved = user_defaults_path(REPOSITORY_ROOT)
+    if saved.is_file():
+        st.caption(f"Valores guardados en {saved.relative_to(REPOSITORY_ROOT).as_posix()}.")
+        if st.button("Restaurar valores originales", key="reset-defaults"):
+            reset_user_defaults(REPOSITORY_ROOT)
+            forget_forecast_widgets()
+            st.session_state["defaults_message"] = "Se restauraron los valores originales del código."
+            st.rerun()
+    else:
+        st.caption("Se están usando los valores originales del código (settings/config.py).")
+
+    section(2, "Composición de platos y vida útil",
+            "Excel base con las hojas «vida_util» y «composicion». Cada análisis usa una copia de este archivo.")
+    try:
+        base = default_parameters_workbook(REPOSITORY_ROOT)
+        base_rows = read_parameters_workbook(base)
+    except (OSError, ValueError) as exc:
+        base, base_rows = None, None
+        st.error(f"El Excel base no se pudo leer: {exc}. Sube uno válido para reemplazarlo.")
+    if base_rows is not None:
+        st.download_button("Descargar Excel base", base, file_name="inventario_parametros.xlsx", mime=XLSX_MIME,
+                           key="download-base-parameters")
+        for tab, (sheet, columns) in zip(st.tabs([f"{name} ({len(base_rows[name])} filas)"
+                                                  for name in INVENTORY_PARAMETER_SHEETS]),
+                                         INVENTORY_PARAMETER_SHEETS.items()):
+            with tab:
+                st.dataframe(pl.DataFrame([[None if v is None else str(v) for v in row] for row in base_rows[sheet]],
+                                          schema=list(columns), orient="row"), hide_index=True, width="stretch")
+    upload_key = f"upload-base-parameters-{st.session_state.get('base_upload_round', 0)}"
+    upload = st.file_uploader("Nuevo Excel base", type=["xlsx"], key=upload_key,
+                              help="Debe tener las hojas «vida_util» y «composicion» con sus columnas. "
+                                   "Se compara con el Excel base antes de reemplazarlo.")
+    if message := st.session_state.pop("base_message", None):
+        st.success(message)
+    if upload is None:
+        return
+    content = upload.getvalue()
+    try:
+        summary = (compare_parameters_workbooks(base, content) if base_rows is not None
+                   else [{"hoja": sheet, "filas_actuales": 0, "filas_nuevas": len(rows), "añadidas": len(rows),
+                          "eliminadas": 0, "sin_cambios": 0} for sheet, rows in read_parameters_workbook(content).items()])
+    except ValueError as exc:
+        st.error(f"Archivo rechazado: {exc}")
+        st.caption("El Excel base no se modificó. Corrige el archivo y vuelve a subirlo.")
+        return
+    st.markdown("**Cambios respecto del Excel base**")
+    for column, row in zip(st.columns(len(summary)), summary):
+        column.metric(f"{row['hoja']}: añadidas / eliminadas", f"+{row['añadidas']} / −{row['eliminadas']}")
+    st.dataframe(pl.DataFrame(summary), hide_index=True, width="stretch")
+    st.caption("Una fila modificada cuenta como una eliminada y una añadida.")
+    if not any(row["añadidas"] or row["eliminadas"] for row in summary):
+        st.info("El archivo no tiene cambios respecto del Excel base.")
+        return
+    if st.button("Reemplazar Excel base", type="primary", key="replace-base-parameters"):
+        backup = replace_default_parameters(content, REPOSITORY_ROOT)
+        changes = "; ".join(f"{row['hoja']}: +{row['añadidas']} / −{row['eliminadas']}" for row in summary)
+        st.session_state["base_message"] = (f"Excel base reemplazado ({changes}). Respaldo del anterior: "
+                                            f"{backup.relative_to(REPOSITORY_ROOT).as_posix()}.")
+        st.session_state["base_upload_round"] = st.session_state.get("base_upload_round", 0) + 1
+        st.rerun()
+
+
+if view == "Valores por defecto":
+    show_defaults_view()
+    st.stop()
+if DEFAULTS_ERROR:
+    st.warning(f"Los valores por defecto guardados no son válidos; se usan los del código. {DEFAULTS_ERROR}")
 
 st.markdown("""
 <div class="mirai-bar">Pronóstico de ventas por producto para MUT y Franklin
@@ -270,13 +524,15 @@ for site in sites:
 section(2, "Ajusta tu pronóstico")
 left, right = st.columns([1, 2])
 with left:
-    horizon = st.number_input("Días calendario a proyectar", min_value=1, max_value=365, value=28,
+    horizon = st.number_input("Días calendario a proyectar", min_value=1, max_value=365,
+                              value=next(iter(DEFAULTS.model_settings.values())).horizon_days,
                               help="Se cuentan desde la última fecha de ventas de cada local. Solo se proyectan sus días de apertura.")
 with right:
     st.info("Puedes dejar los valores sugeridos para comenzar. Los locales se analizan por separado, aunque los ejecutes juntos.")
 settings = {}
+inventory_sites = {}
 for site in sites:
-    default = MODEL_SETTINGS[site]
+    default = DEFAULTS.model_settings[site]
     with st.expander(f"Configuración de {site}", expanded=True):
         a, b = st.columns(2)
         with a:
@@ -287,21 +543,76 @@ for site in sites:
                                  format_func=MODELS.get, key=f"model-{site}",
                                  help="El patrón por mes necesita más historia. Con pocos datos el motor usa un modelo más simple.")
         settings[site] = replace(default, horizon_days=int(horizon), operating_weekdays=tuple(weekdays), model=model)
+        stock = DEFAULTS.inventory_sites[site]
+        c, e = st.columns(2)
+        with c:
+            deliveries = st.multiselect("Días de despacho de pedidos", list(WEEKDAYS), default=list(stock.delivery_weekdays),
+                                        format_func=WEEKDAYS.get, key=f"delivery-{site}", help=DISPATCH_HELP)
+        with e:
+            shortage = st.number_input("Costo de quiebre (veces el costo de una porción)", min_value=0.1, max_value=100.0,
+                                       value=float(stock.shortage_cost), step=0.5, key=f"shortage-{site}",
+                                       help="Supuesto a validar: cuánto peor es que falte una porción que botar una.")
+        transfer = st.checkbox("Enviar sobrantes vigentes a otro local al día siguiente", value=stock.transfer_leftovers,
+                               key=f"transfer-{site}", help="Práctica descrita para Franklin: lo que sobra el domingo va al MUT.")
+        inventory_sites[site] = replace(stock, delivery_weekdays=tuple(deliveries), shortage_cost=float(shortage),
+                                        transfer_leftovers=transfer)
+
+with st.expander("Inventario por ingrediente", expanded=True):
+    inventory_enabled = st.checkbox("Calcular inventario por ingrediente", value=DEFAULTS.inventory.enabled,
+                                    help="Usa el pronóstico de cada plato, su composición y la vida útil de cada ingrediente.")
+    f, g = st.columns(2)
+    with f:
+        confidence = st.slider("Nivel de confianza del intervalo semanal", min_value=0.80, max_value=0.99,
+                               value=DEFAULTS.inventory.confidence_level, step=0.01, format="%.2f")
+    with g:
+        service = st.slider("Nivel de servicio sin vida útil conocida", min_value=0.50, max_value=0.99,
+                            value=DEFAULTS.inventory.default_service_level, step=0.01, format="%.2f",
+                            help="Se aplica a ingredientes sin vida útil en la hoja «vida_util».")
+    st.caption("La vida útil (hoja «vida_util») y los ingredientes de cada plato (hoja «composicion») están en un Excel "
+               "editable. Descárgalo, modifícalo y súbelo para usarlo solo en esta ejecución. Para cambiar el Excel base "
+               "usa la vista «Valores por defecto».")
+    try:
+        st.download_button("Descargar Excel de parámetros actual", default_parameters_workbook(REPOSITORY_ROOT),
+                           file_name="inventario_parametros.xlsx", key="download-parameters",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except OSError:
+        st.warning("No se encontró settings/inventario_parametros.xlsx en el repositorio.")
+    custom = st.file_uploader("Excel de parámetros modificado (opcional)", type=["xlsx"], key="upload-parameters")
+    parameters = custom.getvalue() if custom else None
+    parameters_error = None
+    if parameters is not None:
+        try:
+            validate_parameters_workbook(parameters)
+        except ValueError as exc:
+            parameters_error = str(exc)
+            st.error(parameters_error)
+        else:
+            st.success("Se usará el Excel de parámetros cargado.")
+inventory_settings = replace(DEFAULTS.inventory, enabled=inventory_enabled, confidence_level=float(confidence),
+                             default_service_level=float(service))
 
 with st.expander("Opciones avanzadas"):
-    plots = st.checkbox("Generar gráficos por producto", value=True, help="Puede tardar más si hay muchos productos.")
-    parquet = st.checkbox("Incluir tablas Parquet", value=True, help="Permite explorar las tablas aquí y utilizarlas en otros análisis.")
-    history = st.number_input("Días históricos visibles en los gráficos", min_value=1, max_value=730, value=45)
-    minimum = st.number_input("Mínimo de observaciones para variabilidad por día", min_value=2, max_value=100, value=5)
+    base_settings = next(iter(DEFAULTS.model_settings.values()))
+    plots = st.checkbox("Generar gráficos por producto", value=base_settings.generate_plots,
+                        help="Puede tardar más si hay muchos productos.")
+    parquet = st.checkbox("Incluir tablas Parquet", value=base_settings.export_parquet,
+                          help="Permite explorar las tablas aquí y utilizarlas en otros análisis.")
+    history = st.number_input("Días históricos visibles en los gráficos", min_value=1, max_value=730,
+                              value=base_settings.history_plot_days)
+    minimum = st.number_input("Mínimo de observaciones para variabilidad por día", min_value=2, max_value=100,
+                              value=base_settings.residual_min_observations)
     st.caption("Siempre se genera Excel. Los períodos superpuestos se rechazan para evitar contar ventas dos veces.")
 settings = {site: replace(value, generate_plots=plots, export_parquet=parquet,
                           history_plot_days=int(history), residual_min_observations=int(minimum))
             for site, value in settings.items()}
+inventory_settings = replace(inventory_settings, export_parquet=parquet)
 
-ready = bool(sites) and all(uploads.values()) and all(s.operating_weekdays for s in settings.values())
+ready = (bool(sites) and all(uploads.values()) and all(s.operating_weekdays for s in settings.values())
+         and (not inventory_enabled or (all(s.delivery_weekdays for s in inventory_sites.values())
+                                        and parameters_error is None)))
 st.write("")
 if not ready:
-    st.caption("Para continuar, selecciona al menos un local, carga sus Excel y elige sus días de apertura.")
+    st.caption("Para continuar, selecciona al menos un local, carga sus Excel y elige sus días de apertura y de despacho.")
 st.caption("Se usarán solo los archivos de esta carga. Las ejecuciones anteriores se conservan por separado.")
 if st.button("Generar pronóstico", type="primary", disabled=not ready or not runtime_ready, width="stretch", key="generate"):
     st.session_state.pop("completed_run", None)
@@ -310,9 +621,10 @@ if st.button("Generar pronóstico", type="primary", disabled=not ready or not ru
     with st.status("Preparando el análisis…", expanded=True) as status:
         try:
             validate_uploads(uploads, settings)
-            run = create_run(REPOSITORY_ROOT, uploads, settings)
+            run = create_run(REPOSITORY_ROOT, uploads, settings, parameters if inventory_enabled else None)
             st.write("Archivos guardados. Validando datos y ejecutando los modelos…")
-            execute_run(REPOSITORY_ROOT, run, settings, LiveLog(st.empty()))
+            execute_run(REPOSITORY_ROOT, run, settings, LiveLog(st.empty()),
+                        inventory=inventory_settings, inventory_sites=inventory_sites)
         except Exception as exc:
             status.update(label="No se pudo completar el análisis", state="error")
             st.error(str(exc))

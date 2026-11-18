@@ -1,158 +1,95 @@
 # MIRAI-FORECAST
-ELT of MIRAI FOOD LAB sales data in order to forecast future demand of various products, considering diverse variables such as seasonality, holidays, weeks of the month among other causes.
 
-## Interfaz para usuarios (Windows)
+Pipeline local para transformar ventas de **Franklin y MUT** en pronósticos diarios por producto, sugerencias de inventario por ingrediente y un reporte de producción. Python coordina la ejecución, procesa datos y genera la interfaz y el PDF; R ejecuta los modelos estadísticos.
 
-Haz doble clic en **`iniciar_interfaz.bat`**. Necesitas Python 3.12 o superior;
-la primera apertura necesita Internet para preparar las dependencias Python y R.
-Se abrirá una aplicación local en el navegador. Mantén abierta la consola mientras
-la usas; para cerrarla presiona Ctrl+C en esa consola.
+## Ejecución
 
-1. Selecciona MUT, Franklin o ambos y arrastra uno o varios Excel por local.
-   MUT requiere la hoja `Sheet1`; Franklin requiere `Detalle`, del reporte de
-   ventas por producto. El reporte Franklin Store (`Detalle de ventas`) no está
-   admitido por el modelo de pronóstico actual. Usa `.xlsx` o `.xlsm`, con
-   períodos que no se superpongan.
-2. Elige los días calendario del horizonte, los días de apertura y el patrón de
-   ventas de cada local. Los valores iniciales corresponden al modelo existente.
-   El horizonte empieza después de la última venta del local, no de la fecha actual.
-   Para el inventario elige además, por local, los **días de despacho de pedidos**
-   (días en que se despacha y en que lo despachado queda disponible en el local),
-   el costo de quiebre y si los sobrantes vigentes se envían a otro local. En **Inventario por
-   ingrediente** se fijan el nivel de confianza del intervalo semanal y el nivel de
-   servicio de ingredientes sin vida útil conocida. Ahí también se descarga y se
-   puede volver a subir, editado, el Excel de parámetros (hojas `vida_util` y
-   `composicion`).
-3. Pulsa **Generar pronóstico**. Se validan todos los archivos; si alguno es
-   rechazado, corrígelo antes de ejecutar nuevamente. Los registros permiten
-   identificar el problema sin editar código.
-4. Revisa el pronóstico por producto y descarga el Excel de cada local o el ZIP
-   con todos los informes y gráficos. La pestaña **INVENTARIO** muestra, por
-   ingrediente y semana, los platos esperados que lo usan con su intervalo de
-   confianza, y las preparaciones sugeridas por despacho. La vista previa requiere
-   la opción Parquet.
-
-### Valores por defecto
-
-En la barra lateral, **Vista → Valores por defecto** permite cambiar los valores
-con que parte la pantalla de pronóstico (horizonte, días de apertura, patrón de
-ventas, días de despacho y disponibilidad, costo de quiebre,
-transferencia de sobrantes, opciones de gráficos y del inventario). Se guardan en
-`settings/valores_por_defecto.json`; `main.bat` y los scripts R ejecutados por
-separado también los usan. **Restaurar valores originales** borra ese archivo y
-vuelve a los valores de `settings/config.py`.
-
-En la misma vista se reemplaza el Excel base `settings/inventario_parametros.xlsx`.
-Al subir uno nuevo se valida su formato: hojas `vida_util` y `composicion` con sus
-columnas, ingredientes sin repetir, vida útil positiva o vacía, locales FRANKLIN,
-MUT o AMBOS, ingredientes de `composicion` presentes en `vida_util`, cantidades
-positivas y sin platos con el mismo ingrediente dos veces. Si no cumple, se
-rechaza y el base no cambia. Si cumple, se muestran por hoja las filas añadidas y
-eliminadas (una fila editada cuenta como una eliminada y una añadida) y se
-reemplaza al confirmar. La versión anterior queda respaldada en
-`out/parametros_respaldo/`.
-
-Cada carga usa únicamente sus propios archivos y se guarda por separado en
-`out/ejecuciones/<identificador>/`: originales, datos procesados, registros,
-parámetros y resultados. No mezcla archivos con cargas previas ni cambia los
-valores de `settings/config.py`. Los locales se pronostican por separado, no se
-suman sus ventas. Los datos y resultados están excluidos de Git. La aplicación
-escucha solo en `127.0.0.1` y no requiere una cuenta en Streamlit.
-
-Con el entorno preparado también puedes abrirla desde una terminal:
+Requiere **Windows y Python 3.12 o superior**. Desde la raíz del repositorio:
 
 ```powershell
+.\main.bat                 # Ejecuta el pipeline con los datos locales
+.\iniciar_interfaz.bat     # Abre la interfaz Streamlit para cargar archivos
+```
+
+Si `main.bat` se abre con doble clic, la ventana espera una tecla al terminar para que se puedan leer los mensajes; desde una terminal no espera. Para tareas programadas, define `MIRAI_NO_PAUSE=1`.
+
+Ambos lanzadores crean o reutilizan `.venv`, instalan las dependencias de `requirements.txt` y preparan R y sus paquetes. La primera preparación requiere Internet; las instalaciones locales de R y su biblioteca quedan en `.runtime/` cuando corresponde.
+
+Con el entorno preparado, se puede ejecutar directamente:
+
+```powershell
+.venv\Scripts\python.exe main.py
 .venv\Scripts\python.exe -m streamlit run streamlit_app.py
 ```
 
-El código de la pantalla está en `streamlit_app.py`; el manejo de cargas y
-ejecuciones está en `src/interface.py`. `main.bat` conserva la ejecución habitual
-por consola de ambos modelos. No ejecutes análisis simultáneos: comparten el
-bloqueo del proyecto. Las métricas del modelo son de ajuste histórico y no
-garantizan precisión futura.
+La interfaz permite seleccionar locales, cargar Excel, ajustar parámetros y descargar resultados. Cada carga se aísla en `out/ejecuciones/<identificador>/`, con sus propios originales, datos procesados, configuración y salidas.
 
-# Data MGMT and Privacy
-In order to respect privacy and sensible data management, al files contained within Data folder must be put in the .gitignore and should never be pushed to github.
+## Flujo computacional
 
-## Run the complete pipeline on Windows
-
-With Python 3.12 or newer installed, run or double-click `main.bat`. The first
-execution needs Internet access to install dependencies. It:
-
-1. Creates/reuses `.venv` and installs `requirements.txt` when needed.
-2. Finds an existing R installation or downloads the configured official CRAN
-   installer, verifies its published checksum and installs R under `.runtime/`.
-3. Installs missing R packages in a project library separated by R version.
-4. Calls `main.py`: incremental ELT → Franklin model → MUT model.
-
-Later executions reuse the environments and processed DEL artifacts. The launcher
-works from any current directory and stops when setup fails. Runtime settings,
-the CRAN mirror and model-script paths live in `settings/config.py`.
-
-If the environment is already prepared, run `.venv\Scripts\python.exe main.py`
-directly. This entry point validates configuration and R dependencies but does
-not install software. To use a particular R installation, set `MIRAI_RSCRIPT` to
-its `Rscript.exe` path before execution. Both entry points return exit code 1
-for fatal failures; recoverable ELT warnings allow the accepted data to continue.
-
-`pipeline.log` records setup, ELT and model progress, warnings, child-process
-output and fatal tracebacks. Success messages appear after their stage completes.
-`elt.log` and `elt_log.json` retain the detailed ELT events and processing state.
-An exclusive `.pipeline.lock` prevents concurrent setup/model runs; remove a
-stale lock only after confirming the previous process has stopped.
-
-Private runtime downloads, installed R packages and setup fingerprints live in
-the ignored `.runtime/` directory. Python dependencies are rechecked after a
-change to requirements or the interpreter, or a failed dependency/import check.
-
-## ELT
-
-Install dependencies with `python -m pip install -r requirements.txt` (Python 3.12+).
-Run `python src/elt.py` to process pending RAW exports into DEL Parquet files with Polars,
-or call `ELT().run()` from your application's main function. Importing the module
-does not run the pipeline. Processing status and quality reports are kept locally
-in `elt_log.json` at the repository root. Events go to `elt.log`: warnings allow
-the batch to continue, while errors stop execution and make main return 1.
-
-See [the ELT documentation](docs/elt.md) for supported formats, integrity checks,
-product-name validation, recovery behavior and tests.
-
-## Demand models
-
-Shared settings live in `settings/config.py`: horizon, model, operating weekdays,
-input columns, output formats and plots. Run the ELT before the R models:
-
-```powershell
-Rscript scripts/modelo_demanda_Franklin.R
-Rscript scripts/modelo_demanda_MUT.R
+```text
+Ventas RAW → ELT Python → Parquet DEL → Demanda R por local
+                                      → Reporte PDF Python → Inventario R
 ```
 
-The scripts read accepted DEL Parquet files using `elt_log.json` and save their
-analysis tables, Excel reports, plots and configuration snapshots in
-`out/franklin/` and `out/mut/`. R requires `arrow`, `digest`, `jsonlite`, `tzdb` and
-`writexl`. See [the model documentation](scripts/README_Mirai_GitHub.md).
+`main.py:run_pipeline()` valida configuración y dependencias, ejecuta el ELT y lanza los scripts R como subprocesos, en orden: **Franklin → MUT → reporte → inventario**. El reporte va antes del inventario porque solo usa los pronósticos: un error en el Excel de parámetros detiene el inventario, pero no deja a cocina sin su PDF. Python y R intercambian configuración mediante JSON y resultados mediante archivos.
 
-## Inventory model
+1. **ELT (`src/elt.py`).** Lee Excel con Openpyxl y transforma tablas con Polars. Valida hojas, columnas, fechas, cantidades y controles disponibles; conserva nombres de productos y añade procedencia por fila. Publica Parquet con compresión Snappy en DEL. El procesamiento es incremental: usa hashes SHA-256 y `elt_log.json` para omitir entradas sin cambios y reconstruir salidas faltantes o alteradas.
+2. **Demanda (`scripts/modelo_demanda_*.R`).** Lee únicamente artefactos aceptados por el ELT, verificando su integridad mediante `scripts/demand_io.R`. Suma unidades por fecha y producto y ajusta una regresión lineal independiente por producto y local. Por defecto, MUT usa `demanda ~ dia` y Franklin `demanda ~ dia + mes`, con día y mes categóricos. Si el ajuste o la proyección no son posibles, intenta un modelo solo por día y luego un promedio.
+3. **Inventario (`scripts/modelo_inventario.R`).** Cruza la hoja `Pronosticos` con la composición de platos para convertir demanda en cantidades de ingredientes. Acumula medias y varianzas por semana y ciclo de despacho. Calcula un stock objetivo con una política *newsvendor* (equilibrio entre costo de faltantes y sobrantes), considerando vida útil, días de entrega y sobrantes esperados. La vida útil cuenta desde el día de despacho, cuando termina la preparación. `porciones_esperadas` son porciones del ingrediente (platos × `cantidad_por_plato`); el detalle por plato muestra también `platos_esperados`. En `composicion`, una fila de un local reemplaza a la fila `AMBOS` del mismo plato e ingrediente, sin importar el orden; repetir el mismo local, plato e ingrediente es un error. Igual que el reporte, deja fuera los productos sin ventas recientes (hoja `Productos_sin_ventas_recientes`).
+4. **Producción (`src/report.py`).** Usa pronósticos e históricos de ambos locales y agrupa productos según `settings/reporte_grupos.xlsx`. Genera un PDF por semana, con ciclos viernes–lunes y martes–jueves. La cantidad a producir por local, variante y ciclo es `ceil(sum(mu) + z * sqrt(sum(sigma²)))`, donde `z` depende del nivel de servicio configurado. Por defecto, la semana empieza el próximo viernes; `main.bat --comenzar-hoy` permite iniciarla hoy. Los productos sin ventas en los últimos 14 días de datos de un local (`INACTIVE_PRODUCT_DAYS`, compartido con el inventario) no se producen y se listan al final del PDF, porque los modelos siguen pronosticando platos retirados o renombrados.
 
-`scripts/modelo_inventario.R` runs after the demand models. It reads the `Pronosticos`
-sheet of each demand workbook from the same run, the dish composition and the shelf
-life of each ingredient in `settings/inventario_parametros.xlsx` (sheets `composicion`
-and `vida_util`, editable as tables), and the replenishment calendar in
-`settings/config.py` (`InventorySiteSettings`: dispatch and availability weekdays, shortage cost, leftover
-transfer; `InventorySettings`:
-confidence level and default service level). Preparations are finished on the dispatch
-day and shelf life is counted from that finish date, never from the start. Results go to `out/inventario/`
-(`modelo_inventario.xlsx` and Parquet tables): weekly expected dishes per ingredient with
-a confidence interval, and a perishable newsvendor policy per dispatch. R additionally
-requires `readxl`. Assumptions and sources:
-[SUPUESTOS_modelo_inventario.md](scripts/SUPUESTOS_modelo_inventario.md).
+El horizonte predeterminado es de **28 días calendario desde la última venta de cada local**, filtrados por sus días de apertura: MUT de lunes a domingo y Franklin de viernes a domingo. Desde la primera venta de un producto, su ausencia en una fecha con ventas del local se completa con cero; no se inventan días sin registros del local. Los pronósticos negativos se truncan a cero.
+
+## Entradas y configuración
+
+Para ejecutar por consola, colocar las exportaciones en estas carpetas:
+
+| Entrada | Ubicación / formato |
+|---|---|
+| Ventas Franklin | `Data/RAW/FRANKLIN_SALES/`, Excel con hoja `Detalle` |
+| Ventas MUT | `Data/RAW/MUT_SALES/`, Excel con hoja `Sheet1` |
+| Parámetros de ingredientes | `settings/inventario_parametros.xlsx`, hojas `vida_util` y `composicion` |
+| Grupos del PDF | `settings/reporte_grupos.xlsx`, hoja `grupos` |
+
+Los Excel sueltos directamente en `Data/RAW` no se procesan: el ELT se detiene y lista cada archivo con la carpeta a la que debe moverse.
+
+El ELT admite `.xlsx`, `.xlsm` y `.parquet`; las cargas de la interfaz admiten Excel. También procesa `FRANKLIN_STORE`, pero esa fuente no alimenta el pronóstico actual. En el Excel de parámetros se aceptan decimales con coma (`2,5`); los valores no finitos (`NaN`, `inf`) se rechazan. MUT filtra por defecto las ventas con estado `pagado`. Los modelos rechazan períodos superpuestos entre archivos por defecto; no se eliminan automáticamente líneas de venta repetidas.
+
+`settings/config.py` centraliza rutas, paquetes y parámetros en `ModelSettings`, `InventorySettings` e `InventorySiteSettings`. Los valores guardados desde la interfaz en `settings/valores_por_defecto.json` prevalecen sobre los valores del código para las opciones que contienen. Los scripts R también consumen esa configuración. Para inspeccionar el contrato JSON:
 
 ```powershell
-Rscript scripts/modelo_inventario.R   # after both demand models; uses default settings
+.venv\Scripts\python.exe settings/config.py --site MUT
+.venv\Scripts\python.exe settings/config.py --inventory
 ```
 
-The implemented execution order is `main.bat` → environment setup → `main.py`
-→ ELT → Franklin → MUT → inventory. If any model fails, subsequent stages stop and the
-pipeline does not record a successful completion.
+## Salidas y diagnóstico
 
+Las rutas siguientes son relativas a la raíz del repositorio al ejecutar por consola; en la interfaz, son relativas a la carpeta de cada ejecución:
 
+| Salida | Contenido |
+|---|---|
+| `Data/DEL/<fuente>/` | Tablas de ventas validadas en Parquet |
+| `out/franklin/`, `out/mut/` | Excel, Parquet, gráficos por producto y `config_used.json` |
+| `out/inventario/` | `modelo_inventario.xlsx`, tablas Parquet y configuración utilizada |
+| `out/reporte/` | PDF y `estado.json` con estado y motivo de generación u omisión |
+| `pipeline.log`, `elt.log`, `elt_log.json` | Registro de ejecución, eventos ELT y estado de procesamiento |
+
+Los Excel de demanda incluyen `Pronosticos`, `Historico`, `Metricas`, `Residuos_por_dia`, `Coeficientes` y `Configuracion`. `sigma_utilizada` representa la desviación residual por día de semana si hay suficientes observaciones (cinco por defecto); en otro caso usa la global. Si no se puede estimar (por ejemplo, un producto con una sola venta), el inventario y el PDF usan la aproximación de Poisson (varianza = pronóstico) y nunca una incertidumbre cero.
+
+Un error de modelo detiene las etapas posteriores y la consola devuelve código 1. Los archivos rechazados por el ELT permiten continuar con datos aceptados en consola; la interfaz detiene el análisis si alguno es rechazado. Un problema del PDF se registra sin invalidar los pronósticos. Los bloqueos `.pipeline.lock` y `.elt.lock` impiden ejecuciones simultáneas; eliminar un bloqueo residual solo después de comprobar que el proceso terminó.
+
+## Orientación para mantenimiento
+
+- **Orquestación y entorno:** `main.py`, `src/runtime.py`, `scripts/bootstrap.py`.
+- **Carga, validación y limpieza:** `src/elt.py`; detalle en [docs/elt.md](docs/elt.md).
+- **Modelos:** scripts R y utilidades `scripts/demand_io.R`; detalle en [manual de demanda](scripts/README_Mirai_GitHub.md). La política de inventario se implementa en `scripts/modelo_inventario.R`.
+- **Interfaz y ejecuciones aisladas:** `streamlit_app.py` y `src/interface.py`.
+- **PDF:** `src/report.py`.
+
+Las pruebas usan datos sintéticos y se ejecutan con:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Las pruebas de integración R requieren el ejecutable y sus paquetes; `MIRAI_RSCRIPT` permite indicar una instalación específica. Las métricas de demanda son de ajuste histórico, sin validación temporal. El inventario y el PDF suman varianzas bajo supuestos de independencia y aproximación normal. Los datos, resultados y registros contienen información privada y deben permanecer fuera de Git.

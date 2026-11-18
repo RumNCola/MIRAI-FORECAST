@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import math
 import re
 import zipfile
 from datetime import datetime
@@ -30,12 +31,14 @@ def _cell(value) -> str | float | None:
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, (int, float)):
-        return float(value)
+        return float(value) if math.isfinite(value) else str(value)
     text = str(value).strip()
     try:
-        return float(text.replace(",", "."))
+        number = float(text.replace(",", "."))
     except ValueError:
         return text
+    # "NaN", "inf"... are text for the validators, which only accept finite numbers.
+    return number if math.isfinite(number) else text
 
 
 def read_parameters_workbook(content: bytes) -> dict[str, list[tuple]]:
@@ -178,7 +181,8 @@ def create_run(root: Path, uploads: dict[str, list[tuple[str, bytes]]],
 def execute_run(root: Path, run: Path, settings: dict[str, ModelSettings],
                 handler: logging.Handler | None = None, *,
                 inventory: InventorySettings | None = None,
-                inventory_sites: dict[str, InventorySiteSettings] | None = None) -> None:
+                inventory_sites: dict[str, InventorySiteSettings] | None = None,
+                report_start_today: bool = False) -> None:
     with pipeline_logger(run) as logger:
         if handler:
             logger.addHandler(handler)
@@ -188,7 +192,8 @@ def execute_run(root: Path, run: Path, settings: dict[str, ModelSettings],
                 parameters = run / PARAMETERS_IN_RUN
                 run_pipeline(root, logger, model_settings=settings, data_root=run, strict_inputs=True,
                              inventory_settings=inventory, inventory_sites=inventory_sites,
-                             parameters_workbook=parameters if parameters.is_file() else None)
+                             parameters_workbook=parameters if parameters.is_file() else None,
+                             report_start_today=report_start_today)
                 logger.info("Análisis finalizado correctamente")
         except Exception:
             logger.exception("No se pudo completar el análisis")

@@ -186,6 +186,12 @@ class ELTTests(unittest.TestCase):
         self.assertEqual(record["last_success"]["output_sha256"], digest)
         self.assertFalse(self.elt.lock_path.exists())
 
+    def test_loose_raw_files_are_explained(self):
+        (self.elt.raw_dir / "ventas.xlsx").write_bytes(b"not read")
+        (self.elt.raw_dir / "~$ventas.xlsx").write_bytes(b"office lock file")
+        with self.assertRaisesRegex(ELTError, r"sueltos en Data/RAW.*ventas\.xlsx\. Mueve"):
+            self.elt.discover_files()
+
     def test_corrupt_log_and_existing_lock_fail_without_resetting_state(self):
         self.elt.log_path.write_text("invalid json", encoding="utf-8")
         with self.assertRaises(ELTError):

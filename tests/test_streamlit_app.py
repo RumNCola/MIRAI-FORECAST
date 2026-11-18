@@ -24,6 +24,39 @@ class StreamlitTests(unittest.TestCase):
             self.assertEqual(len(app.file_uploader), 3)  # two sites plus the optional parameters workbook
             self.assertEqual(len(app.multiselect), 5)  # sites, then opening and dispatch days per site
 
+    def test_production_report_option_and_download(self):
+        from streamlit.testing.v1 import AppTest
+        from src.interface import create_run as real_create_run
+        from src.report import write_status
+        stream = io.BytesIO()
+        workbook = Workbook()
+        workbook.active.title = "Sheet1"
+        workbook.save(stream)
+
+        def fake_model(root, run, settings, handler, **options):
+            output = run / "out" / "mut"
+            output.mkdir(parents=True)
+            (output / "config_used.json").write_text(json.dumps({"horizon_days": 28, "model": "dia"}))
+            report = run / "out" / "reporte"
+            report.mkdir(parents=True)
+            (report / "reporte_produccion_2026-11-20.pdf").write_bytes(b"%PDF-1.4 fixture")
+            write_status(report, "generado", "Reporte de la semana vie 20/11 – jue 26/11.",
+                         "reporte_produccion_2026-11-20.pdf")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("src.runtime.find_rscript", return_value=Path("Rscript.exe")), \
+             patch("src.interface.create_run", side_effect=lambda root, uploads, settings, parameters=None: real_create_run(Path(directory), uploads, settings, parameters)), \
+             patch("src.interface.execute_run", side_effect=fake_model) as execute:
+            app = AppTest.from_file(str(APP), default_timeout=30).run()
+            self.assertFalse(app.checkbox(key="report-start-today").value)        # off by default
+            app.checkbox(key="report-start-today").check().run()
+            app.file_uploader[0].set_value(("ventas.xlsx", stream.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")).run()
+            app.button[0].click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(execute.call_args.kwargs["report_start_today"])
+            keys = [button.key for button in app.get("download_button")]
+            self.assertIn("download-report", keys)
+
     def test_upload_execute_and_render_forecast(self):
         from streamlit.testing.v1 import AppTest
         import polars as pl
@@ -43,7 +76,7 @@ class StreamlitTests(unittest.TestCase):
             inventory.mkdir(parents=True)
             (inventory / "modelo_inventario.xlsx").write_bytes(stream.getvalue())
             pl.DataFrame({"local": ["MUT"], "semana_inicio": ["2026-11-16"], "dias_en_horizonte": [7],
-                          "ingrediente": ["caldo tonkotsu"], "platos_esperados": [120.0], "desviacion_estandar": [10.0],
+                          "ingrediente": ["caldo tonkotsu"], "porciones_esperadas": [120.0], "desviacion_estandar": [10.0],
                           "nivel_confianza": [0.95], "ic_inferior": [100.4], "ic_superior": [139.6],
                           "vida_util_dias": [6.0], "platos_que_lo_usan": ["Tonkotsu"], "porciones_a_preparar": [140]}
                          ).write_parquet(inventory / "resumen_semanal.parquet")
@@ -66,7 +99,7 @@ class StreamlitTests(unittest.TestCase):
             self.assertIn("INVENTARIO", [tab.label for tab in app.tabs])
             metrics = {metric.label: metric.value for metric in app.metric}
             self.assertEqual(metrics["Productos"], "1")
-            self.assertEqual(metrics["Platos esperados (1.ª semana)"], "120")
+            self.assertEqual(metrics["Porciones esperadas (1.ª semana)"], "120")
             self.assertEqual(metrics["IC 95%"], "100 – 140")
 
     def test_defaults_view_saves_values_and_replaces_base_after_showing_changes(self):
@@ -131,7 +164,7 @@ class StreamlitTests(unittest.TestCase):
             inventory = run / "out" / "inventario"
             inventory.mkdir(parents=True)
             pl.DataFrame({"local": ["MUT"] * 3, "semana_inicio": ["2026-11-16"] * 3, "dias_en_horizonte": [7] * 3,
-                          "ingrediente": ["arroz", "caldo tonkotsu", "mochi"], "platos_esperados": [10.0, 50.0, 20.0],
+                          "ingrediente": ["arroz", "caldo tonkotsu", "mochi"], "porciones_esperadas": [10.0, 50.0, 20.0],
                           "desviacion_estandar": [1.0] * 3, "nivel_confianza": [0.95] * 3,
                           "ic_inferior": [8.0, 48.0, 18.0], "ic_superior": [12.0, 52.0, 22.0],
                           "vida_util_dias": [30.0, 6.0, 2.0], "platos_que_lo_usan": ["x"] * 3}

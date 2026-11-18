@@ -14,6 +14,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Every package the pipeline imports at run time (reportlab: production report PDF).
+IMPORT_CHECK = "import polars, openpyxl, pyarrow, streamlit, reportlab"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -36,13 +38,13 @@ def prepare_python(root: Path, logger: logging.Logger) -> None:
             logger.warning("Python setup state is unreadable; dependencies will be checked again", exc_info=True)
     check = subprocess.run([sys.executable, "-m", "pip", "check"], cwd=root,
                            capture_output=True, text=True, check=False)
-    imports = subprocess.run([sys.executable, "-c", "import polars, openpyxl, streamlit"], cwd=root,
+    imports = subprocess.run([sys.executable, "-c", IMPORT_CHECK], cwd=root,
                              capture_output=True, text=True, check=False)
     if previous != fingerprint or check.returncode or imports.returncode:
         run_logged([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements)],
                    label="Python dependency installation", root=root, logger=logger)
         run_logged([sys.executable, "-m", "pip", "check"], label="Python dependency verification", root=root, logger=logger)
-        run_logged([sys.executable, "-c", "import polars, openpyxl, streamlit"],
+        run_logged([sys.executable, "-c", IMPORT_CHECK],
                    label="Python import verification", root=root, logger=logger)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = state_path.with_suffix(".tmp")

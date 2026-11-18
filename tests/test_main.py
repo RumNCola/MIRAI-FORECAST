@@ -166,13 +166,15 @@ class RuntimeTests(unittest.TestCase):
             (root / "scripts").mkdir()
             (root / "scripts" / "bootstrap.py").write_text("raise SystemExit(0)", encoding="utf-8")
             (root / "main.py").write_text("from pathlib import Path\nPath('called').write_text('yes')\nraise SystemExit(7)", encoding="utf-8")
+            # "cmd /c main.bat" looks like a double-click to the launcher: never wait for a key in tests.
+            no_pause = {**os.environ, "MIRAI_NO_PAUSE": "1"}
             result = subprocess.run(["cmd.exe", "/d", "/c", str(root / "main.bat")], cwd=directory,
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, env=no_pause, stdin=subprocess.DEVNULL)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertTrue((root / "called").exists())
             (root / "called").unlink()
             (root / "scripts" / "bootstrap.py").write_text("raise SystemExit(1)", encoding="utf-8")
             result = subprocess.run(["cmd.exe", "/d", "/c", str(root / "main.bat")], cwd=directory,
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, env=no_pause, stdin=subprocess.DEVNULL)
             self.assertEqual(result.returncode, 1)
             self.assertFalse((root / "called").exists())

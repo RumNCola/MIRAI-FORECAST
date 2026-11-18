@@ -1,5 +1,9 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+rem Usage: main.bat [--comenzar-hoy]
+rem When opened with a double-click, the window waits for a key at the end so messages can be read.
+rem Set MIRAI_NO_PAUSE=1 to never wait (scheduled tasks, scripts).
+set "MIRAI_SCRIPT=%~nx0"
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
 
@@ -29,9 +33,11 @@ set "PYTHONUTF8=1"
 ".venv\Scripts\python.exe" "scripts\bootstrap.py"
 if errorlevel 1 goto failed
 
-".venv\Scripts\python.exe" "main.py"
+".venv\Scripts\python.exe" "main.py" %*
 set "MIRAI_EXIT_CODE=%errorlevel%"
 popd
+if not "%MIRAI_EXIT_CODE%"=="0" echo ERROR: Execution stopped. See pipeline.log for the details.
+call :pause_if_double_clicked
 exit /b %MIRAI_EXIT_CODE%
 
 :missing_python
@@ -46,4 +52,14 @@ goto failed
 :failed
 echo ERROR: Execution stopped. See pipeline.log for setup and analysis details.
 popd
+call :pause_if_double_clicked
 exit /b 1
+
+:pause_if_double_clicked
+rem A double-click opens a new window just for this script ("cmd.exe /c ...main.bat"); a terminal
+rem the user typed into does not mention it. Only the first case closes before messages can be read.
+if defined MIRAI_NO_PAUSE exit /b 0
+echo(%cmdcmdline%| findstr /i /l /c:"%MIRAI_SCRIPT%" >nul || exit /b 0
+echo.
+pause
+exit /b 0

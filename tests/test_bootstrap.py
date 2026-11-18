@@ -34,6 +34,19 @@ class BootstrapTests(unittest.TestCase):
             bootstrap.prepare_python(self.root, self.logger)
             self.assertEqual(run.call_count, 3)
 
+    def test_missing_report_package_reinstalls_even_when_prepared(self):
+        def missing_reportlab(command, **kwargs):
+            # pip check passes, but the import check fails when reportlab is absent.
+            return Mock(returncode=1 if "reportlab" in command[-1] else 0)
+        with patch("scripts.bootstrap.subprocess.run", return_value=Mock(returncode=0)), \
+                patch("scripts.bootstrap.run_logged"):
+            bootstrap.prepare_python(self.root, self.logger)               # state recorded
+        with patch("scripts.bootstrap.subprocess.run", side_effect=missing_reportlab), \
+                patch("scripts.bootstrap.run_logged") as run:
+            bootstrap.prepare_python(self.root, self.logger)
+            self.assertEqual(run.call_count, 3)                             # reinstalled, not "already prepared"
+        self.assertIn("reportlab", bootstrap.IMPORT_CHECK)
+
     def test_failed_python_install_is_not_cached(self):
         with patch("scripts.bootstrap.subprocess.run", return_value=Mock(returncode=0)), \
                 patch("scripts.bootstrap.run_logged", side_effect=PipelineError("download failed")):

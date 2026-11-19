@@ -110,8 +110,11 @@ read_parameters <- function(config) {
   comp$local <- toupper(trimws(comp$local))
   comp$ingrediente <- trimws(comp$ingrediente)
   comp$cantidad_por_plato <- parse_number(comp$cantidad_por_plato)
-  if (anyNA(comp$producto) || anyNA(comp$ingrediente) || any(!comp$local %in% c("FRANKLIN", "MUT", "AMBOS"))) {
-    stop("composicion: every row needs local (FRANKLIN, MUT or AMBOS), producto and ingrediente", call. = FALSE)
+  # AMBOS applies a row to every site (both restaurants and the store).
+  known_sites <- c("FRANKLIN", "MUT", "FRANKLIN_STORE", "AMBOS")
+  if (anyNA(comp$producto) || anyNA(comp$ingrediente) || any(!comp$local %in% known_sites)) {
+    stop("composicion: every row needs local (", paste(known_sites, collapse = ", "), "), producto and ingrediente",
+         call. = FALSE)
   }
   if (anyNA(comp$cantidad_por_plato) || any(!is.finite(comp$cantidad_por_plato) | comp$cantidad_por_plato <= 0)) {
     stop("composicion: cantidad_por_plato must be a positive number", call. = FALSE)

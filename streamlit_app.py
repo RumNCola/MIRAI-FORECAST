@@ -12,7 +12,7 @@ import polars as pl
 import streamlit as st
 
 from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_SETTINGS, MODEL_SETTINGS, REPORT_OUTPUT_SUBDIRECTORY,
-                             REPORT_SITES, REPOSITORY_ROOT,
+                             REPORT_SITES, REPOSITORY_ROOT, SITE_LABELS, WORKBOOK_NAMES,
                              Defaults, code_defaults, load_user_defaults, reset_user_defaults, save_user_defaults,
                              user_defaults_path)
 from src.interface import (compare_parameters_workbooks, create_run, default_parameters_workbook, execute_run,
@@ -248,7 +248,8 @@ def show_inventory(output: Path) -> None:
         return
     confidence = float(weekly["nivel_confianza"][0])
     a, b = st.columns(2)
-    site = a.selectbox("Local", weekly["local"].unique(maintain_order=True).to_list(), key="inventory-site")
+    site = a.selectbox("Local", weekly["local"].unique(maintain_order=True).to_list(), key="inventory-site",
+                       format_func=lambda code: SITE_LABELS.get(code, code))
     site_rows = weekly.filter(pl.col("local") == site)
     with b:
         ingredients = ordered_options(site_rows, "ingrediente", "porciones_esperadas", "inventory-ingredient")
@@ -323,7 +324,8 @@ def show_results(run: Path, sites: list[str]) -> None:
     show_report(run)
     inventory_output = run / "out" / INVENTORY_SETTINGS.output_subdirectory
     has_inventory = inventory_output.exists()
-    tabs = st.tabs([*sites, "INVENTARIO"] if has_inventory else sites)
+    names = [SITE_LABELS[site] for site in sites]
+    tabs = st.tabs([*names, "INVENTARIO"] if has_inventory else names)
     if has_inventory:
         with tabs[-1]:
             show_inventory(inventory_output)
@@ -332,9 +334,9 @@ def show_results(run: Path, sites: list[str]) -> None:
             output = run / "out" / MODEL_SETTINGS[site].output_subdirectory
             snapshot = json.loads((output / "config_used.json").read_text(encoding="utf-8"))
             st.caption(f"Horizonte: {snapshot['horizon_days']} días calendario · Modelo: {MODELS[snapshot['model']]}")
-            workbook = output / ("modelo_demanda_Franklin.xlsx" if site == "FRANKLIN" else "modelo_demanda_MUT.xlsx")
+            workbook = output / f"modelo_demanda_{WORKBOOK_NAMES[site]}.xlsx"
             if workbook.exists():
-                st.download_button(f"Descargar Excel de {site}", workbook.read_bytes(), file_name=workbook.name,
+                st.download_button(f"Descargar Excel de {SITE_LABELS[site]}", workbook.read_bytes(), file_name=workbook.name,
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"download-{site}")
             forecast = output / "pronosticos.parquet"
             products = []
@@ -427,7 +429,7 @@ def show_defaults_view() -> None:
         model_settings, inventory_sites = {}, {}
         for site in MODEL_SETTINGS:
             model, stock = current.model_settings[site], current.inventory_sites[site]
-            st.subheader(site)
+            st.subheader(SITE_LABELS[site])
             f, g = st.columns(2)
             opening = f.multiselect("Días de apertura", list(WEEKDAYS), default=list(model.operating_weekdays),
                                     format_func=WEEKDAYS.get, key=f"def-days-{site}")
@@ -538,7 +540,7 @@ if DEFAULTS_ERROR:
     st.warning(f"Los valores por defecto guardados no son válidos; se usan los del código. {DEFAULTS_ERROR}")
 
 st.markdown("""
-<div class="mirai-bar">Pronóstico de ventas por producto para MUT y Franklin
+<div class="mirai-bar">Pronóstico de ventas por producto para MUT, Franklin y la tienda
   <a href="#carga">Comenzar ahora&nbsp;→</a></div>
 <div class="mirai-hero">
   <div class="mirai-kicker">Mirai Food Lab / Planificación</div>
@@ -567,18 +569,21 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 section(1, "Carga tus ventas", anchor="carga")
-sites = st.multiselect("¿Qué locales quieres analizar?", ["MUT", "FRANKLIN"], default=["MUT"],
-                       help="Puedes ejecutar un solo local o ambos. Cada local tendrá su propio informe.")
+sites = st.multiselect("¿Qué locales quieres analizar?", list(MODEL_SETTINGS), default=["MUT"], format_func=SITE_LABELS.get,
+                       help="Puedes ejecutar uno o varios locales. Cada local tendrá su propio informe.")
 uploads = {}
 for site in sites:
     with st.container(border=True, key=f"site-card-{site}"):
-        st.subheader(site)
+        st.subheader(SITE_LABELS[site])
         if site == "MUT":
             st.caption("Exportación de pedidos de MUT · hoja Sheet1. Se consideran los pedidos pagados.")
-        else:
+        elif site == "FRANKLIN":
             st.caption("Exportación de ventas por producto de Franklin · hoja Detalle.")
-            st.info("El reporte de tienda con hoja «Detalle de ventas» contiene movimientos y notas de crédito; el modelo actual requiere el reporte de ventas con hoja «Detalle».")
-        files = st.file_uploader(f"Excel de {site}", type=["xlsx", "xlsm"], accept_multiple_files=True, key=f"upload-{site}",
+            st.info("El reporte de la tienda (hoja «Detalle de ventas») va en Tienda Franklin, no aquí.")
+        else:
+            st.caption("Reporte de la tienda Franklin · hoja «Detalle de ventas». Se consideran las ventas; "
+                       "las notas de crédito (devoluciones y anulaciones) no cuentan como demanda.")
+        files = st.file_uploader(f"Excel de {SITE_LABELS[site]}", type=["xlsx", "xlsm"], accept_multiple_files=True, key=f"upload-{site}",
                                 help="Arrastra uno o varios archivos. Usa períodos que no se superpongan.")
         uploads[site] = [(f.name, f.getvalue()) for f in files]
         if files:
@@ -596,7 +601,7 @@ settings = {}
 inventory_sites = {}
 for site in sites:
     default = DEFAULTS.model_settings[site]
-    with st.expander(f"Configuración de {site}", expanded=True):
+    with st.expander(f"Configuración de {SITE_LABELS[site]}", expanded=True):
         a, b = st.columns(2)
         with a:
             weekdays = st.multiselect("Días de apertura", list(WEEKDAYS), default=list(default.operating_weekdays),
@@ -682,7 +687,8 @@ if not ready:
     st.caption("Para continuar, selecciona al menos un local, carga sus Excel y elige sus días de apertura y de despacho.")
 st.caption("Se usarán solo los archivos de esta carga. Las ejecuciones anteriores se conservan por separado.")
 if sites and set(REPORT_SITES) - set(sites):
-    st.caption("El reporte de producción para la cocina central se genera cuando analizas MUT y FRANKLIN juntos.")
+    st.caption("El reporte de producción para la cocina central se genera cuando analizas MUT, Franklin y "
+               "Tienda Franklin juntos.")
 if st.button("Generar pronóstico", type="primary", disabled=not ready or not runtime_ready, width="stretch", key="generate"):
     st.session_state.pop("completed_run", None)
     st.session_state.pop("failed_run", None)
@@ -717,4 +723,4 @@ if "completed_run" in st.session_state:
     show_results(Path(path), completed_sites)
 
 st.markdown('<div class="mirai-footer"><strong>Mirai Food Lab · Planificación</strong>'
-            'Herramienta interna de pronóstico de ventas · MUT y Franklin</div>', unsafe_allow_html=True)
+            'Herramienta interna de pronóstico de ventas · MUT, Franklin y Tienda Franklin</div>', unsafe_allow_html=True)

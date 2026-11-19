@@ -88,3 +88,8 @@ docs/_build/
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# R session files (RStudio / interactive R)
+.Rhistory
+.RData
+.Rproj.user/

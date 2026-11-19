@@ -22,7 +22,13 @@ CRAN_MIRROR = "https://cloud.r-project.org"
 MODEL_SCRIPTS = {
     "FRANKLIN": "scripts/modelo_demanda_Franklin.R",
     "MUT": "scripts/modelo_demanda_MUT.R",
+    "FRANKLIN_STORE": "scripts/modelo_demanda_Franklin_Store.R",
 }
+# Names shown to users, and the demand workbook of each site (out/<site>/modelo_demanda_<name>.xlsx).
+SITE_LABELS = {"FRANKLIN": "Franklin", "MUT": "MUT", "FRANKLIN_STORE": "Tienda Franklin"}
+WORKBOOK_NAMES = {"FRANKLIN": "Franklin", "MUT": "MUT", "FRANKLIN_STORE": "Franklin_Store"}
+SITE_SOURCES = {"FRANKLIN": {"FRANKLIN_SALES"}, "MUT": {"MUT_SALES", "MUT_STORE"},
+                "FRANKLIN_STORE": {"FRANKLIN_STORE"}}
 INVENTORY_SCRIPT = "scripts/modelo_inventario.R"
 INVENTORY_R_PACKAGES = ("jsonlite", "readxl", "writexl")
 # Tabular, user-editable inputs of the inventory model: sheet "vida_util" (shelf life counted
@@ -39,8 +45,8 @@ REPORT_GROUPS_WORKBOOK = "settings/reporte_grupos.xlsx"
 REPORT_GROUPS_SHEET = "grupos"
 REPORT_GROUPS_COLUMNS = ("local", "producto", "grupo", "variante", "nota")
 REPORT_EXCLUDED_GROUP = "NO INCLUIR"
-# The report needs every location the kitchen supplies (Franklin Store joins once it has a model).
-REPORT_SITES = ("MUT", "FRANKLIN")
+# The report needs every location the kitchen supplies: both restaurants and the Franklin store.
+REPORT_SITES = ("MUT", "FRANKLIN", "FRANKLIN_STORE")
 REPORT_OUTPUT_SUBDIRECTORY = "reporte"
 # Traffic light: |forecast vs last 7 days of sales| below the first value = stable (green),
 # up to the second = yellow, above = red.
@@ -50,6 +56,9 @@ REPORT_STALE_DATA_DAYS = 7
 # models keep forecasting old names, so the production report and the inventory model both leave them out.
 INACTIVE_PRODUCT_DAYS = 14
 REPORT_INACTIVE_DAYS = INACTIVE_PRODUCT_DAYS
+# Products first sold less than this many days before the end of the data have too little history for a
+# reliable forecast (a launch day can look like normal demand): the report marks them with "*".
+REPORT_MIN_HISTORY_DAYS = 14
 # Production cycles: (label, ISO weekdays). Cycle 1 Friday-Monday, cycle 2 Tuesday-Thursday.
 REPORT_CYCLES = (("Vie–Lun", (5, 6, 7, 1)), ("Mar–Jue", (2, 3, 4)))
 REPORT_WEEK_START = 5  # The default report week runs Friday to Thursday.
@@ -66,6 +75,11 @@ class ModelSettings:
     product_column: str = "product_name"
     quantity_column: str = "quantity"
     paid_statuses: tuple[str, ...] = ()
+    # Column holding the values of paid_statuses (MUT: order status; store: Venta / Nota de crédito).
+    status_column: str = "status"
+    # Optional column appended to the product name ("KOMBUCHA 330CC - Hibiscus"): the store sells one
+    # product in several flavours or sizes. Empty = the product column alone.
+    variant_column: str = ""
     reject_overlapping_dates: bool = True
     export_excel: bool = True
     export_parquet: bool = True
@@ -102,6 +116,12 @@ class ModelSettings:
             raise ValueError("Date, product and quantity columns must be distinct")
         if any(not isinstance(status, str) or not status.strip() for status in self.paid_statuses):
             raise ValueError("paid_statuses must contain nonempty strings")
+        if not isinstance(self.status_column, str) or not self.status_column.strip():
+            raise ValueError("status_column must be a nonempty string")
+        if not isinstance(self.variant_column, str):
+            raise ValueError("variant_column must be a string (empty for none)")
+        if self.variant_column and self.variant_column in {self.date_column, self.product_column, self.quantity_column}:
+            raise ValueError("variant_column must differ from the date, product and quantity columns")
 
 
 MODEL_SETTINGS = {
@@ -112,6 +132,15 @@ MODEL_SETTINGS = {
     "MUT": ModelSettings(
         source="MUT_SALES", model="dia", operating_weekdays=(1, 2, 3, 4, 5, 6, 7),
         output_subdirectory="mut", paid_statuses=("pagado",),
+    ),
+    # Franklin store: sells every day; a product is name + variant (flavour/size). Only sales lines count:
+    # credit notes (returns, cancellations) carry negative quantities and are not demand. Pattern "dia":
+    # with one year of data, a 4-week backtest (Oct 2026) missed 482 units on the top 12 products with
+    # "dia" against 763 with "dia_mes_anual" (one November only to estimate the month effect).
+    "FRANKLIN_STORE": ModelSettings(
+        source="FRANKLIN_STORE", model="dia", operating_weekdays=(1, 2, 3, 4, 5, 6, 7),
+        output_subdirectory="franklin_store", paid_statuses=("Venta",), status_column="movement",
+        variant_column="variant",
     ),
 }
 
@@ -124,8 +153,7 @@ def get_model_config(site: str, *, settings: ModelSettings | None = None,
         raise ValueError(f"Unknown site: {site}")
     settings = settings if settings is not None else MODEL_SETTINGS[site]
     settings.validate()
-    allowed_sources = {"FRANKLIN": {"FRANKLIN_SALES"}, "MUT": {"MUT_SALES", "MUT_STORE"}}
-    if settings.source not in allowed_sources[site]:
+    if settings.source not in SITE_SOURCES[site]:
         raise ValueError(f"Unsupported source for {site}: {settings.source}")
     root = Path(repository_root).resolve() if repository_root is not None else REPOSITORY_ROOT
     subdirectory = Path(settings.output_subdirectory)
@@ -143,7 +171,7 @@ def get_model_config(site: str, *, settings: ModelSettings | None = None,
         "processing_log": (root / "elt_log.json").as_posix(),
         "output_directory": output.as_posix(),
         "graphs_directory": (output / "graphs").as_posix(),
-        "workbook_filename": f"modelo_demanda_{'Franklin' if site == 'FRANKLIN' else 'MUT'}.xlsx",
+        "workbook_filename": f"modelo_demanda_{WORKBOOK_NAMES[site]}.xlsx",
         "required_r_packages": packages,
     }
 
@@ -207,6 +235,8 @@ INVENTORY_SITE_SETTINGS = {
     # Franklin's production is ready on Thursday for the Friday-Sunday service.
     "FRANKLIN": InventorySiteSettings(delivery_weekdays=(5,), transfer_leftovers=True),
     "MUT": InventorySiteSettings(delivery_weekdays=(2, 5)),
+    # The store is restocked with the kitchen's two cycles, like MUT (Tuesday and Friday).
+    "FRANKLIN_STORE": InventorySiteSettings(delivery_weekdays=(2, 5)),
 }
 INVENTORY_SETTINGS = InventorySettings()
 

@@ -1,6 +1,8 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem Usage: main.bat [--comenzar-hoy]
+rem Runs ELT, the demand models of every site in settings/config.py (Franklin, MUT, Franklin store),
+rem the production report and the inventory. Exports go in Data/RAW/<SOURCE>/ (store: FRANKLIN_STORE).
 rem When opened with a double-click, the window waits for a key at the end so messages can be read.
 rem Set MIRAI_NO_PAUSE=1 to never wait (scheduled tasks, scripts).
 set "MIRAI_SCRIPT=%~nx0"

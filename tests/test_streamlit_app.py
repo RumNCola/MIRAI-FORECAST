@@ -24,6 +24,17 @@ class StreamlitTests(unittest.TestCase):
             self.assertEqual(len(app.file_uploader), 3)  # two sites plus the optional parameters workbook
             self.assertEqual(len(app.multiselect), 5)  # sites, then opening and dispatch days per site
 
+    def test_store_is_offered_as_a_third_location(self):
+        from streamlit.testing.v1 import AppTest
+        with patch("src.runtime.find_rscript", return_value=Path("Rscript.exe")):
+            app = AppTest.from_file(str(APP), default_timeout=30).run()
+            self.assertEqual(app.multiselect[0].options, ["Franklin", "MUT", "Tienda Franklin"])
+            app.multiselect[0].set_value(["MUT", "FRANKLIN", "FRANKLIN_STORE"]).run()
+            self.assertFalse(app.exception)
+            self.assertEqual([uploader.label for uploader in app.file_uploader][:3],
+                             ["Excel de MUT", "Excel de Franklin", "Excel de Tienda Franklin"])
+            self.assertTrue(any("notas de crédito" in caption.value for caption in app.caption))
+
     def test_production_report_option_and_download(self):
         from streamlit.testing.v1 import AppTest
         from src.interface import create_run as real_create_run

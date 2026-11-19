@@ -15,7 +15,7 @@ from pathlib import Path
 
 import polars as pl
 
-from settings.config import MODEL_SETTINGS, get_model_config, load_user_defaults
+from settings.config import MODEL_SCRIPTS, MODEL_SETTINGS, get_model_config, load_user_defaults
 from src.elt import ELT
 from src.runtime import find_rscript, r_environment
 
@@ -145,9 +145,36 @@ class RModelIntegrationTests(unittest.TestCase):
         self.environment = {**self.r_environment, "MIRAI_PYTHON": sys.executable}
 
     def run_model(self, site):
-        script = "modelo_demanda_Franklin.R" if site == "FRANKLIN" else "modelo_demanda_MUT.R"
+        script = Path(MODEL_SCRIPTS[site]).name
         return subprocess.run([str(self.rscript), "--vanilla", str(self.root / "scripts" / script)], cwd=self.root.parent,
                               env=self.environment, capture_output=True, text=True)
+
+    def test_store_model_counts_sales_by_product_and_variant(self):
+        # Store export: line-level sales and credit notes (negative), one product in several flavours.
+        lines = []
+        for day in range(28):
+            date = datetime(2026, 7, 6) + timedelta(days=day)
+            for name, variant, quantity in (("KOMBUCHA 330CC", "Hibiscus", 3), ("KOMBUCHA 330CC", "Jengibre", 1),
+                                            ("KIMCHI", "KIMCHI", 2)):
+                lines.append({"date": date, "movement": "VENTA", "document": "BOLETA ELECTRÓNICA",
+                              "document_number": str(day), "category": "Productos", "product_name": name,
+                              "variant": variant, "quantity": quantity})
+        lines.append({"date": datetime(2026, 7, 20), "movement": "Nota de crédito",
+                      "document": "NOTA DE CRÉDITO ELECTRÓNICA", "document_number": "nc-1", "category": "Productos",
+                      "product_name": "KOMBUCHA 330CC", "variant": "Hibiscus", "quantity": -5})
+        (self.raw / "FRANKLIN_STORE").mkdir(parents=True)
+        pl.DataFrame(lines).write_parquet(self.raw / "FRANKLIN_STORE" / "store.parquet")
+        self.assertEqual(ELT(self.root).run().failed, 0)
+        completed = self.run_model("FRANKLIN_STORE")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("1 lines excluded", completed.stderr)                      # the credit note
+        output = self.root / "out" / "franklin_store"
+        metrics = pl.read_parquet(output / "metricas.parquet")
+        self.assertEqual(dict(metrics.select("producto", "unidades_vendidas").iter_rows()),
+                         {"KOMBUCHA 330CC - Hibiscus": 84, "KOMBUCHA 330CC - Jengibre": 28, "KIMCHI": 56})
+        self.assertEqual(pl.read_parquet(output / "pronosticos.parquet")["fecha"].n_unique(), 7)  # open every day
+        self.assertEqual(len(list(output.glob("*.parquet"))), 6)
+        self.assertTrue((output / "modelo_demanda_Franklin_Store.xlsx").is_file())
 
     def test_models_read_del_and_write_configured_analysis_outputs(self):
         # Untracked DEL files must not enter a model, even when they look like exports.

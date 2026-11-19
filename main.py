@@ -1,4 +1,4 @@
-"""Run incremental ELT, the Franklin and MUT demand models, the inventory model and the production report.
+"""Run incremental ELT, the demand models (Franklin, MUT, Franklin store), the production report and the inventory.
 
 Usage: main.bat [--comenzar-hoy]   (the report starts today instead of next Friday)
 """
@@ -82,7 +82,7 @@ def run_pipeline(root: Path, logger: logging.Logger, *,
         run_logged([str(rscript), "--vanilla", str(root / relative)],
                    label=f"{site} demand model", root=root, logger=logger, env=model_environment)
         logger.info("%s analysis saved in %s", site, configurations[site]["output_directory"])
-    # Production report for the central kitchen: needs MUT and Franklin from this same run. It only
+    # Production report for the central kitchen: needs every site in REPORT_SITES from this same run. It only
     # uses the demand outputs, so it runs before the inventory: a broken parameters workbook must
     # not leave the kitchen without its PDF.
     from src.report import generate_report

@@ -37,6 +37,8 @@ GROUP_ROWS = [
     ("AMBOS", "Tantanmen vegano", "Tantanmen", "Vegano / vegetariano", "vegano y vegetariano juntos"),
     ("AMBOS", "Tantanmen vegetariano", "Tantanmen", "Vegano / vegetariano", "vegano y vegetariano juntos"),
     ("AMBOS", "Agua", "NO INCLUIR", "", "bebida"),
+    ("MUT", "Kombucha Hibiscus", "Kombuchas", "Hibiscus", ""),
+    ("FRANKLIN_STORE", "KOMBUCHA 330CC - Hibiscus", "Kombuchas", "Hibiscus", ""),
 ]
 
 
@@ -47,7 +49,7 @@ def site_frames(products: dict[str, float], weekdays: set[int], *, start: date, 
     forecast = pl.DataFrame([{"fecha": d, "producto": p, "demanda_predicha": mu, "sigma_utilizada": sigma}
                              for p, mu in products.items() for d in dates])
     end = history_end or start - timedelta(days=1)
-    past = [end - timedelta(days=i) for i in range(14) if (end - timedelta(days=i)).isoweekday() in weekdays]
+    past = [end - timedelta(days=i) for i in range(28) if (end - timedelta(days=i)).isoweekday() in weekdays]
     history = pl.DataFrame([{"fecha": d, "producto": p, "observado": mu if sold is None else sold}
                             for p, mu in products.items() for d in past])
     return forecast, history
@@ -161,6 +163,28 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(data.groups[0].sites["MUT"][0].produce,
                          [production_quantity(40, 16, Z95), production_quantity(30, 12, Z95)])
 
+    def test_store_and_restaurants_share_a_page(self):
+        self.outputs["FRANKLIN_STORE"] = prepared({"KOMBUCHA 330CC - Hibiscus": 20}, {1, 2, 3, 4, 5, 6, 7},
+                                                  start=date(2026, 11, 19), days=21)
+        self.outputs["MUT"] = prepared({"Tonkotsu": 10, "Kombucha Hibiscus": 5}, {1, 2, 3, 4, 5, 6, 7},
+                                       start=date(2026, 11, 19), days=21)
+        data = self.build()
+        kombuchas = next(group for group in data.groups if group.name == "Kombuchas")
+        self.assertEqual(list(kombuchas.sites), ["MUT", "FRANKLIN_STORE"])
+        self.assertEqual(kombuchas.produce(0), kombuchas.sites["MUT"][0].produce[0] +
+                         kombuchas.sites["FRANKLIN_STORE"][0].produce[0])
+        self.assertIsNone(kombuchas.trends["FRANKLIN"])                     # "no se vende"
+        self.assertEqual(list(data.last_data), ["MUT", "FRANKLIN", "FRANKLIN_STORE"])
+
+    def test_products_with_little_history_are_marked(self):
+        forecast, history = self.outputs["MUT"]
+        launch = pl.DataFrame({"fecha": [date(2026, 11, 17), date(2026, 11, 18)], "producto": ["Tantanmen vegano"] * 2,
+                               "observado": [16.0, 3.0]})
+        self.outputs["MUT"] = (forecast, pl.concat([history.filter(pl.col("producto") != "Tantanmen vegano"), launch]))
+        tantanmen = self.build().groups[1]
+        self.assertEqual([(line.variant, line.few_data) for line in tantanmen.variants],
+                         [("Carnívoro", False), ("Vegano / vegetariano", True)])
+
     def test_forecast_must_cover_the_week(self):
         self.outputs["MUT"] = prepared({"Tonkotsu": 10}, {1, 2, 3, 4, 5, 6, 7}, start=date(2026, 10, 1), days=28)
         with self.assertRaisesRegex(ReportError, "MUT.*Carga ventas más recientes"):
@@ -241,7 +265,8 @@ class GenerateTests(unittest.TestCase):
         self.sites = {}
         start = date(2026, 11, 19)
         for site, products, weekdays in (("MUT", {"Tonkotsu": 10}, {1, 2, 3, 4, 5, 6, 7}),
-                                         ("FRANKLIN", {"TONKOTSU": 30}, {5, 6, 7})):
+                                         ("FRANKLIN", {"TONKOTSU": 30}, {5, 6, 7}),
+                                         ("FRANKLIN_STORE", {"KOMBUCHA 330CC - Hibiscus": 20}, {1, 2, 3, 4, 5, 6, 7})):
             output = self.root / "out" / site.lower()
             output.mkdir(parents=True)
             forecast, history = site_frames(products, weekdays, start=start, days=21)
@@ -252,12 +277,12 @@ class GenerateTests(unittest.TestCase):
     def generate(self, sites):
         return generate_report(self.root, sites, self.groups, self.logger, service_level=0.95, today=TODAY)
 
-    def test_needs_both_restaurants(self):
+    def test_needs_both_restaurants_and_the_store(self):
         with self.assertLogs(self.logger, "INFO"):
-            self.assertIsNone(self.generate({"MUT": self.sites["MUT"]}))
+            self.assertIsNone(self.generate({"MUT": self.sites["MUT"], "FRANKLIN": self.sites["FRANKLIN"]}))
         status = read_status(self.root / "out" / "reporte")
         self.assertEqual(status["estado"], "omitido")
-        self.assertIn("Franklin", status["mensaje"])
+        self.assertIn("faltó Tienda Franklin", status["mensaje"])
 
     @unittest.skipUnless(importlib.util.find_spec("reportlab"), "reportlab is not installed")
     def test_writes_pdf_and_status(self):
@@ -292,10 +317,18 @@ class GenerateTests(unittest.TestCase):
 class MappingTests(unittest.TestCase):
     def test_repository_mapping_is_valid(self):
         mapping = read_group_mapping(REPOSITORY_ROOT / REPORT_GROUPS_WORKBOOK)
-        self.assertEqual(mapping.groups[:4], ("Tonkotsu", "Tantanmen", "Udon", "Entradas"))
+        self.assertEqual(mapping.groups, ("Tonkotsu", "Tantanmen", "Udon", "Entradas", "Otros fondos", "Kombuchas",
+                                          "Conservas (tienda)"))
         self.assertEqual(mapping.lookup("FRANKLIN", "TANTANMEN VEGETARIANO").variant, "Vegano / vegetariano")
         self.assertEqual(mapping.lookup("MUT", "TONKOTSU KIDS ").group, "Tonkotsu")
-        self.assertEqual(mapping.lookup("MUT", "Kombucha Jengibre").group, "")         # NO INCLUIR
+        # Kombuchas are summed by flavour over the three sites; store jars have their own page.
+        self.assertEqual((mapping.lookup("MUT", "Kombucha Jengibre").group, mapping.lookup("MUT", "Kombucha Jengibre").variant),
+                         ("Kombuchas", "Jengibre"))
+        self.assertEqual(mapping.lookup("FRANKLIN", "JENGIBRE / TE VERDE").variant, "Jengibre")
+        self.assertEqual(mapping.lookup("FRANKLIN_STORE", "KOMBUCHA 330CC - Jengibre").variant, "Jengibre")
+        self.assertEqual(mapping.lookup("FRANKLIN_STORE", "KIMCHI - 460 CC").group, "Conservas (tienda)")
+        for excluded in ("ENVÍO - ENVÍO $3000", "Palillos", "PACK APERITIVO"):
+            self.assertEqual(mapping.lookup("FRANKLIN_STORE", excluded).group, "")                 # NO INCLUIR
 
     def test_invalid_rows_are_explained(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -339,7 +372,8 @@ class PipelineTests(unittest.TestCase):
              patch("src.report.generate_report", side_effect=lambda *a, **k: calls.append("report")):
             root = Path(directory)
             for relative in ("scripts/prepare_r.R", "scripts/modelo_demanda_Franklin.R", "scripts/modelo_demanda_MUT.R",
-                             "scripts/modelo_inventario.R", "settings/inventario_parametros.xlsx"):
+                             "scripts/modelo_demanda_Franklin_Store.R", "scripts/modelo_inventario.R",
+                             "settings/inventario_parametros.xlsx"):
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("#")
             elt.return_value.run.return_value.failed = 0

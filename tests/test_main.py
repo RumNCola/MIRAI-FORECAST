@@ -44,14 +44,14 @@ class PipelineTests(unittest.TestCase):
         self.elt.return_value.run.side_effect = elt_result
         self.assertEqual(application.main(self.root), 0)
         self.assertEqual(order, ["R dependency check", "ELT", "FRANKLIN demand model", "MUT demand model",
-                                 "Inventory model"])
+                                 "FRANKLIN_STORE demand model", "Inventory model"])
         self.assertIn("Analysis pipeline completed successfully", self.events())
         self.assertFalse((self.root / ".pipeline.lock").exists())
 
     def test_recoverable_elt_rejections_allow_both_models(self):
         self.elt.return_value.run.return_value = Mock(processed=1, skipped=0, failed=1)
         self.assertEqual(application.main(self.root), 0)
-        self.assertEqual(self.child.call_count, 4)
+        self.assertEqual(self.child.call_count, 5)          # R check, three demand models, inventory
         self.assertIn("WARNING", self.events())
         self.assertNotIn("ERROR", self.events())
 
@@ -84,8 +84,9 @@ class PipelineTests(unittest.TestCase):
         environment = inventory_call.kwargs["env"]
         self.assertNotIn("MIRAI_MODEL_CONFIG", environment)
         config = __import__("json").loads(Path(environment["MIRAI_INVENTORY_CONFIG"]).read_text(encoding="utf-8"))
-        self.assertEqual([site["site"] for site in config["sites"]], ["FRANKLIN", "MUT"])
+        self.assertEqual([site["site"] for site in config["sites"]], ["FRANKLIN", "MUT", "FRANKLIN_STORE"])
         self.assertEqual(config["sites"][1]["delivery_weekdays"], [2, 5])
+        self.assertEqual(config["sites"][2]["delivery_weekdays"], [2, 5])
         self.assertIn("Inventory analysis saved", self.events())
 
     def test_saved_defaults_drive_console_runs(self):

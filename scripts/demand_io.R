@@ -105,7 +105,18 @@ check_export_overlap <- function(dates, input_files, config) {
   }
 }
 
+# Store products come in flavours/sizes: "KOMBUCHA 330CC" + "Hibiscus" -> "KOMBUCHA 330CC - Hibiscus".
+# An empty variant, or one that only repeats the product name, leaves the name unchanged.
+product_with_variant <- function(products, variants) {
+  variants <- trimws(gsub("\\s+", " ", as.character(variants)))
+  same <- toupper(variants) == toupper(trimws(gsub("\\s+", " ", products)))
+  keep <- !is.na(variants) & nzchar(variants) & !same
+  ifelse(keep, paste0(products, " - ", variants), products)
+}
+
 read_del_sales <- function(config) {
+  status_column <- if (length(config$status_column) && nzchar(config$status_column)) config$status_column else "status"
+  variant_column <- if (length(config$variant_column)) config$variant_column else ""
   records <- select_del_records(config)
   tables <- list()
   input_files <- character()
@@ -122,7 +133,8 @@ read_del_sales <- function(config) {
     raw <- as.data.frame(arrow::read_parquet(path, as_data_frame = TRUE))
     required <- c(config$date_column, config$product_column, config$quantity_column,
                   "source", "source_file", "source_sha256")
-    if (length(config$paid_statuses)) required <- c(required, "status")
+    if (length(config$paid_statuses)) required <- c(required, status_column)
+    if (nzchar(variant_column)) required <- c(required, variant_column)
     if (!all(required %in% names(raw))) {
       stop("Missing model columns in ", entry$output, ": ",
            paste(setdiff(required, names(raw)), collapse = ", "), call. = FALSE)
@@ -130,8 +142,17 @@ read_del_sales <- function(config) {
     units <- as.numeric(raw[[config$quantity_column]])
     dates <- as_model_date(raw[[config$date_column]])
     products <- as.character(raw[[config$product_column]])
+    if (nzchar(variant_column)) products <- product_with_variant(products, raw[[variant_column]])
+    # Lines outside paid_statuses (MUT unpaid orders, store credit notes) are not demand; only the lines
+    # that are kept must be non-negative (credit notes carry negative quantities by design).
+    accepted <- rep(TRUE, nrow(raw))
+    if (length(config$paid_statuses)) {
+      # Case- and space-insensitive, as the ELT validates them ("Venta" = "VENTA").
+      accepted <- !is.na(raw[[status_column]]) &
+        tolower(trimws(raw[[status_column]])) %in% tolower(trimws(config$paid_statuses))
+    }
     if (!nrow(raw) || anyNA(dates) || anyNA(products) || any(!nzchar(trimws(products))) ||
-        any(!is.finite(units)) || any(units < 0)) {
+        any(!is.finite(units)) || any(units[accepted] < 0)) {
       stop("Invalid model input values in ", entry$output, call. = FALSE)
     }
     if (anyNA(raw$source) || any(raw$source != config$source) ||
@@ -141,9 +162,9 @@ read_del_sales <- function(config) {
     }
     check_table <- data.frame(fecha = dates, producto = products, demanda = units,
                               input_file = entry$output, stringsAsFactors = FALSE)
-    if (length(config$paid_statuses)) {
-      accepted <- !is.na(raw$status) & raw$status %in% config$paid_statuses
-      if (any(!accepted)) warning(sum(!accepted), " non-paid lines excluded from ", entry$output, call. = FALSE)
+    if (any(!accepted)) {
+      warning(sum(!accepted), " lines excluded from ", entry$output, " (", status_column, " not in: ",
+              paste(config$paid_statuses, collapse = ", "), ")", call. = FALSE)
       check_table <- check_table[accepted, , drop = FALSE]
     }
     tables[[length(tables) + 1L]] <- check_table

@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from main import run_pipeline
-from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_PARAMETERS_WORKBOOK, REPOSITORY_ROOT,
+from settings.config import (INVENTORY_PARAMETER_SHEETS, INVENTORY_PARAMETERS_WORKBOOK, MODEL_SETTINGS, REPOSITORY_ROOT,
                              InventorySettings, InventorySiteSettings, ModelSettings, get_model_config)
 from src.runtime import pipeline_lock, pipeline_logger
 
@@ -88,8 +88,8 @@ def read_parameters_workbook(content: bytes) -> dict[str, list[tuple]]:
     for number, (site, product, ingredient, quantity, _source) in enumerate(rows["composicion"], 2):
         site = str(site or "").strip().upper()
         ingredient = str(ingredient or "").strip().lower()
-        if site not in {"FRANKLIN", "MUT", "AMBOS"}:
-            raise ValueError(f"composicion, fila {number}: local debe ser FRANKLIN, MUT o AMBOS.")
+        if site not in {*MODEL_SETTINGS, "AMBOS"}:
+            raise ValueError(f"composicion, fila {number}: local debe ser {', '.join(MODEL_SETTINGS)} o AMBOS.")
         if product is None or not ingredient:
             raise ValueError(f"composicion, fila {number}: faltan producto o ingrediente.")
         if ingredient not in shelf:

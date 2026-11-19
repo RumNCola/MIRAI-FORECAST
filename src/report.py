@@ -1,6 +1,7 @@
 """Production report (PDF) for the central kitchen that supplies every location.
 
-The kitchen produces in two cycles (Friday-Monday and Tuesday-Thursday) for MUT and Franklin.
+The kitchen produces in two cycles (Friday-Monday and Tuesday-Thursday) for MUT, Franklin and the
+Franklin store.
 For every group of dishes (settings/reporte_grupos.xlsx) the report states how many dishes to
 produce per cycle, how many to dispatch to each location, and whether demand is rising or falling.
 
@@ -32,12 +33,16 @@ from typing import Iterable
 import polars as pl
 
 from settings.config import (REPORT_CYCLES, REPORT_EXCLUDED_GROUP, REPORT_GROUPS_COLUMNS, REPORT_GROUPS_SHEET,
-                             REPORT_INACTIVE_DAYS, REPORT_OUTPUT_SUBDIRECTORY, REPORT_SITES,
-                             REPORT_STALE_DATA_DAYS, REPORT_TREND_THRESHOLDS, REPORT_WEEK_START)
+                             REPORT_INACTIVE_DAYS, REPORT_MIN_HISTORY_DAYS, REPORT_OUTPUT_SUBDIRECTORY, REPORT_SITES,
+                             REPORT_STALE_DATA_DAYS, REPORT_TREND_THRESHOLDS, REPORT_WEEK_START, SITE_LABELS)
 
 STATUS_FILE = "estado.json"
 WEEKDAYS_SHORT = ("lun", "mar", "mié", "jue", "vie", "sáb", "dom")
-SITE_LABELS = {"MUT": "MUT", "FRANKLIN": "Franklin"}
+
+def sites_text(sites) -> str:
+    """'MUT, Franklin y Tienda Franklin'."""
+    names = [SITE_LABELS[site] for site in sites]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " y " + names[-1]
 
 
 class ReportError(Exception):
@@ -292,6 +297,7 @@ class VariantLine:
     variant: str
     produce: list[int]        # per block
     forecast: list[float]     # per block
+    few_data: bool = False    # some product of this line has less than REPORT_MIN_HISTORY_DAYS of history
 
     @property
     def total(self) -> int:
@@ -397,6 +403,7 @@ def build_report(outputs: dict[str, tuple[pl.DataFrame, pl.DataFrame]], mapping:
         sold = history.filter(pl.col("observado") > 0)
         active = set(sold.filter(pl.col("fecha") > last - timedelta(days=REPORT_INACTIVE_DAYS))["producto"].to_list())
         last_sale = dict(sold.group_by("producto").agg(pl.col("fecha").max()).iter_rows())
+        first_sale = dict(sold.group_by("producto").agg(pl.col("fecha").min()).iter_rows())
         for product in sorted(set(week["producto"].to_list()) | set(recent["producto"].to_list())):
             rule = mapping.lookup(site, product)
             units = float(week.filter(pl.col("producto") == product)["mu"].sum())
@@ -407,9 +414,11 @@ def build_report(outputs: dict[str, tuple[pl.DataFrame, pl.DataFrame]], mapping:
             elif rule is None:
                 unmapped.append((site, product.strip(), units))
             elif rule.group:
+                started = first_sale.get(product)
+                new = started is None or (last - started).days + 1 < REPORT_MIN_HISTORY_DAYS
                 for day, mu, variance in week.filter(pl.col("producto") == product).select(
                         "fecha", "mu", "varianza").iter_rows():
-                    rows.append((site, rule, day, mu, variance))
+                    rows.append((site, rule, day, mu, variance, new))
                 for day, observed in recent.filter(pl.col("producto") == product).select(
                         "fecha", "observado").iter_rows():
                     actual_rows.append((site, rule.group, day, observed))
@@ -434,14 +443,16 @@ def build_report(outputs: dict[str, tuple[pl.DataFrame, pl.DataFrame]], mapping:
                     continue
                 mu = [sum(r[3] for r in selected if block_of[r[2]] == b) for b in range(len(blocks))]
                 var = [sum(r[4] for r in selected if block_of[r[2]] == b) for b in range(len(blocks))]
-                lines.append(VariantLine(variant, [production_quantity(m, v, z) for m, v in zip(mu, var)], mu))
+                lines.append(VariantLine(variant, [production_quantity(m, v, z) for m, v in zip(mu, var)], mu,
+                                         any(r[5] for r in selected)))
             if lines:
                 per_site[site] = lines
         variants = []
         for variant in order:
             parts = [line for lines in per_site.values() for line in lines if line.variant == variant]
             variants.append(VariantLine(variant, [sum(p.produce[b] for p in parts) for b in range(len(blocks))],
-                                        [sum(p.forecast[b] for p in parts) for b in range(len(blocks))]))
+                                        [sum(p.forecast[b] for p in parts) for b in range(len(blocks))],
+                                        any(p.few_data for p in parts)))
         trends: dict[str, Trend | None] = {}
         for site in sites:
             sold = site in per_site or any(r[0] == site for r in group_actual)
@@ -473,6 +484,7 @@ def render_pdf(data: ReportData, path: Path) -> Path:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
+    from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer,
                                     Table, TableStyle)
 
@@ -503,11 +515,16 @@ def render_pdf(data: ReportData, path: Path) -> Path:
     def number(value: float) -> str:
         return f"{value:,.0f}".replace(",", ".")
 
-    def badge(trend: Trend | None, wide: bool = False) -> Drawing:
-        """Traffic light: coloured dot, arrow, word and percentage. Readable in black and white."""
-        drawing = Drawing(150 if wide else 96, 14)
+    def badge(trend: Trend | None, wide: bool = False, space: float = 96) -> Drawing:
+        """Traffic light: coloured dot, arrow, word and percentage. Readable in black and white.
+
+        space: width available in the table cell; the text shrinks so it never runs into the next column.
+        """
+        width_available = 150 if wide else space
+        drawing = Drawing(width_available, 14)
         if trend is None:
-            drawing.add(String(2, 3, "no se vende", fontName="Helvetica", fontSize=7.5, fillColor=soft))
+            drawing.add(String(2, 3, "no se vende", fontName="Helvetica", fontSize=min(7.5, width_available / 8),
+                               fillColor=soft))
             return drawing
         color = light[trend.level]
         drawing.add(Circle(6, 7, 5, fillColor=color, strokeColor=color))
@@ -520,7 +537,10 @@ def render_pdf(data: ReportData, path: Path) -> Path:
         text = f"{trend.word} {trend.percent}".strip()
         if wide and change is not None:
             text += f"  ({number(trend.forecast)} vs {number(trend.actual)})"
-        drawing.add(String(27, 3, text, fontName="Helvetica-Bold", fontSize=8, fillColor=ink))
+        size = 8.0
+        while size > 5.5 and stringWidth(text, "Helvetica-Bold", size) > width_available - 29:
+            size -= 0.25
+        drawing.add(String(27, 3, text, fontName="Helvetica-Bold", fontSize=size, fillColor=ink))
         return drawing
 
     def table(rows, columns, *, header_rows=1, bold_rows=(), shade_rows=()):
@@ -539,6 +559,9 @@ def render_pdf(data: ReportData, path: Path) -> Path:
             commands.append(("BACKGROUND", (0, index), (-1, index), blush))
         result.setStyle(TableStyle(commands))
         return result
+
+    def label(line: VariantLine) -> str:
+        return f"{line.variant} *" if line.few_data else line.variant
 
     def block_header(block: Block) -> Paragraph:
         return Paragraph(f"{block.name}<br/><font size=7>{block.dates}</font>", head_num)
@@ -623,13 +646,13 @@ def render_pdf(data: ReportData, path: Path) -> Path:
         canvas.restoreState()
 
     story = [Paragraph("REPORTE DE PRODUCCIÓN", title),
-             Paragraph(f"Semana {data.week_label} · MUT y Franklin", subtitle), Spacer(1, 6)]
-    for site in data.stale_sites:
-        last = data.last_data[site]
+             Paragraph(f"Semana {data.week_label} · {sites_text(data.last_data)}", subtitle), Spacer(1, 6)]
+    if data.stale_sites:
+        listed = "; ".join(f"{SITE_LABELS[site]} hasta el {data.last_data[site]:%d/%m/%Y} "
+                           f"({(data.today - data.last_data[site]).days} días)" for site in data.stale_sites)
         warning = Table([[Paragraph(
-            f"<b>Atención:</b> las ventas de {SITE_LABELS[site]} llegan solo hasta el {last:%d/%m/%Y} "
-            f"({(data.today - last).days} días). Carga ventas más recientes para un pronóstico confiable.", body)]],
-            colWidths=[width])
+            f"<b>Atención:</b> las ventas cargadas llegan solo a: {listed}. Carga ventas más recientes para un "
+            f"pronóstico confiable.", body)]], colWidths=[width])
         warning.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FEF3C7")),
                                      ("BOX", (0, 0), (-1, -1), 0.8, light["amarillo"]),
                                      ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
@@ -638,13 +661,15 @@ def render_pdf(data: ReportData, path: Path) -> Path:
     story.append(Paragraph("Resumen: qué producir", heading))
     sites = list(data.last_data)
     count = len(data.blocks)
-    columns = [width * 0.2] + [width * 0.14] * count + [width * 0.13]
-    columns += [(width - sum(columns)) / len(sites)] * len(sites)
+    # Narrower number columns leave room for one trend column per site (three with the store).
+    columns = [width * 0.17] + [width * 0.11] * count + [width * 0.11]
+    trend_width = (width - sum(columns)) / len(sites)
+    columns += [trend_width] * len(sites)
     rows = [[Paragraph("Grupo", head_cell), *[block_header(b) for b in data.blocks],
              Paragraph("Total semana", head_num), *[Paragraph(f"Tendencia {SITE_LABELS[s]}", head_cell) for s in sites]]]
     for group in data.groups:
         rows.append([Paragraph(f"<b>{group.name}</b>", cell), *[number(group.produce(i)) for i in range(count)],
-                     number(group.total), *[badge(group.trends.get(s)) for s in sites]])
+                     number(group.total), *[badge(group.trends.get(s), space=trend_width - 12) for s in sites]])
     summary = table(rows, columns)
     summary.setStyle(TableStyle([("FONTNAME", (1, 1), (count, -1), "Helvetica-Bold"),
                                  ("FONTSIZE", (1, 1), (count + 1, -1), 13),
@@ -671,7 +696,7 @@ def render_pdf(data: ReportData, path: Path) -> Path:
         columns = [width * 0.4] + [width * 0.45 / count] * count + [width * 0.15]
         header = [Paragraph("Variante", head_cell), *[block_header(b) for b in data.blocks],
                   Paragraph("Total", head_num)]
-        rows = [header] + [[Paragraph(line.variant, cell), *[number(q) for q in line.produce], number(line.total)]
+        rows = [header] + [[Paragraph(label(line), cell), *[number(q) for q in line.produce], number(line.total)]
                            for line in group.variants]
         rows.append([Paragraph("<b>Total</b>", cell), *[number(group.produce(i)) for i in range(count)],
                      number(group.total)])
@@ -679,6 +704,10 @@ def render_pdf(data: ReportData, path: Path) -> Path:
                       table(rows, columns, bold_rows=(len(rows) - 1,), shade_rows=(len(rows) - 1,))]
         if group.notes:
             production.append(Paragraph("Nota: " + "; ".join(group.notes) + ".", small))
+        if any(line.few_data for line in group.variants):
+            production.append(Paragraph(f"* Menos de {REPORT_MIN_HISTORY_DAYS} días con ventas registradas: el "
+                                        "pronóstico es poco confiable (puede reflejar solo el lanzamiento). "
+                                        "Revísalo antes de producir.", small))
         story.append(KeepTogether(production))
 
         rows, bold, shade = [[Paragraph("Local / variante", head_cell), *[block_header(b) for b in data.blocks],
@@ -688,7 +717,7 @@ def render_pdf(data: ReportData, path: Path) -> Path:
             bold.append(len(rows))
             shade.append(len(rows))
             rows.append([Paragraph(f"<b>{SITE_LABELS[site]}</b>", cell), *map(number, totals), number(sum(totals))])
-            rows += [[Paragraph("&nbsp;&nbsp;&nbsp;" + line.variant, cell), *[number(q) for q in line.produce],
+            rows += [[Paragraph("&nbsp;&nbsp;&nbsp;" + label(line), cell), *[number(q) for q in line.produce],
                       number(line.total)] for line in lines]
         story += [CondPageBreak(60), Paragraph("Despacho por local (unidades a enviar)", heading),
                   table(rows, columns, bold_rows=bold, shade_rows=shade)]
@@ -754,8 +783,8 @@ def generate_report(workspace: Path, site_outputs: dict[str, tuple[Path, str]], 
     directory = workspace / "out" / REPORT_OUTPUT_SUBDIRECTORY
     missing = [site for site in REPORT_SITES if site not in site_outputs]
     if missing:
-        message = (f"El reporte de producción necesita los datos de {' y '.join(SITE_LABELS[s] for s in REPORT_SITES)} "
-                   f"en la misma ejecución; faltó {', '.join(SITE_LABELS[s] for s in missing)}.")
+        message = (f"El reporte de producción necesita los datos de {sites_text(REPORT_SITES)} "
+                   f"en la misma ejecución; faltó {sites_text(missing)}.")
         write_status(directory, "omitido", message)
         logger.info("Production report skipped: %s", message)
         return None
